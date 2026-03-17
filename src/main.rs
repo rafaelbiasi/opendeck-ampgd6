@@ -1,7 +1,7 @@
 use device::{handle_error, handle_set_image};
 use mirajazz::device::Device;
 use openaction::*;
-use std::{collections::HashMap, process::exit, sync::LazyLock};
+use std::{collections::HashMap, process::exit, sync::LazyLock, time::Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use watcher::watcher_task;
@@ -19,6 +19,16 @@ pub static DEVICES: LazyLock<RwLock<HashMap<String, Device>>> =
 pub static TOKENS: LazyLock<RwLock<HashMap<String, CancellationToken>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 pub static TRACKER: LazyLock<Mutex<TaskTracker>> = LazyLock::new(|| Mutex::new(TaskTracker::new()));
+pub static PROFILE_REDRAW_GUARD: LazyLock<Mutex<ProfileRedrawGuard>> =
+    LazyLock::new(|| Mutex::new(ProfileRedrawGuard::default()));
+
+#[derive(Default)]
+pub struct ProfileRedrawGuard {
+    pub last_key_down: Option<(u8, Instant)>,
+    pub burst_count: usize,
+    pub burst_started_at: Option<Instant>,
+    pub suppress_key_until: Option<(u8, Instant)>,
+}
 
 struct GlobalEventHandler {}
 impl openaction::GlobalEventHandler for GlobalEventHandler {
