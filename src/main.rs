@@ -1,7 +1,7 @@
 use device::{handle_error, handle_set_image};
 use mirajazz::device::Device;
 use openaction::*;
-use std::{collections::HashMap, process::exit, sync::Arc, sync::LazyLock, time::Instant};
+use std::{collections::HashMap, sync::Arc, sync::LazyLock, time::Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use watcher::watcher_task;
@@ -118,12 +118,13 @@ async fn shutdown() {
     }
 }
 
-async fn connect() {
-    if let Err(error) = init_plugin(GlobalEventHandler {}, ActionEventHandler {}).await {
-        log::error!("Failed to initialize plugin: {}", error);
-
-        exit(1);
-    }
+async fn connect() -> Result<(), Box<dyn std::error::Error>> {
+    init_plugin(GlobalEventHandler {}, ActionEventHandler {})
+        .await
+        .map_err(|error| {
+            log::error!("Failed to initialize plugin: {}", error);
+            Box::new(error) as Box<dyn std::error::Error>
+        })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -137,10 +138,7 @@ async fn sigterm() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(target_os = "windows")]
 async fn sigterm() -> Result<(), Box<dyn std::error::Error>> {
-    // Future that would never resolve, so select only acts on OpenDeck connection loss
-    // TODO: Proper windows termination handling
-    std::future::pending::<()>().await;
-
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
@@ -154,10 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .unwrap_or_else(|err| eprintln!("Failed to initialize logger: {err}"));
 
-    tokio::select! {
-        _ = connect() => {},
-        _ = sigterm() => {},
-    }
+    let result = tokio::select! {
+        result = connect() => result,
+        result = sigterm() => result,
+    };
 
     log::info!("Shutting down");
 
@@ -172,5 +170,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Tasks are finished, exiting now");
 
-    Ok(())
+    result
 }
