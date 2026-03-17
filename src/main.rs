@@ -1,7 +1,7 @@
 use device::{handle_error, handle_set_image};
 use mirajazz::device::Device;
 use openaction::*;
-use std::{collections::HashMap, process::exit, sync::LazyLock, time::Instant};
+use std::{collections::HashMap, process::exit, sync::Arc, sync::LazyLock, time::Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use watcher::watcher_task;
@@ -21,6 +21,12 @@ pub static TOKENS: LazyLock<RwLock<HashMap<String, CancellationToken>>> =
 pub static TRACKER: LazyLock<Mutex<TaskTracker>> = LazyLock::new(|| Mutex::new(TaskTracker::new()));
 pub static PROFILE_REDRAW_GUARD: LazyLock<Mutex<ProfileRedrawGuard>> =
     LazyLock::new(|| Mutex::new(ProfileRedrawGuard::default()));
+pub static IMAGE_FLUSH_GENERATIONS: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static DEVICE_IMAGE_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static LAST_IMAGE_HASHES: LazyLock<Mutex<HashMap<(String, u8), Option<u64>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Default)]
 pub struct ProfileRedrawGuard {

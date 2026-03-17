@@ -5,17 +5,27 @@ use image::{
 };
 use mirajazz::{device::Device, error::MirajazzError, state::DeviceStateUpdate};
 use openaction::{OUTBOUND_EVENT_MANAGER, SetImageEvent};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    DEVICES, PROFILE_REDRAW_GUARD, TOKENS,
+    DEVICE_IMAGE_LOCKS, DEVICES, IMAGE_FLUSH_GENERATIONS, LAST_IMAGE_HASHES,
+    PROFILE_REDRAW_GUARD, TOKENS,
     inputs::opendeck_to_device,
     mappings::{
         COL_COUNT, CandidateDevice, ENCODER_COUNT, KEY_COUNT, Kind, ROW_COUNT,
         get_image_format_for_key,
     },
 };
+
+const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(35);
+const PRESSED_IMAGE_FLUSH_WINDOW: Duration = Duration::from_millis(120);
+const PROFILE_REDRAW_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Initializes a device and listens for events
 pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
@@ -144,6 +154,9 @@ pub async fn handle_error(id: &String, err: MirajazzError) -> bool {
 
     log::info!("Removing device {} from the list", id);
     DEVICES.write().await.remove(id);
+    IMAGE_FLUSH_GENERATIONS.lock().await.remove(id);
+    DEVICE_IMAGE_LOCKS.lock().await.remove(id);
+    clear_cached_frames(id).await;
 
     log::info!("Finished clean-up for {}", id);
 
@@ -331,7 +344,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
 fn normalize_button_image(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
     // Keep the whole icon visible and center it on a black canvas.
     // This avoids clipping icons that are slightly off-center in the source artwork.
-    let resized = image.resize(width, height, FilterType::Lanczos3).to_rgb8();
+    let resized = image.resize(width, height, FilterType::Triangle).to_rgb8();
     let mut canvas: RgbImage = ImageBuffer::from_pixel(width, height, Rgb([0, 0, 0]));
     let x = (width.saturating_sub(resized.width())) / 2;
     let y = (height.saturating_sub(resized.height())) / 2;
@@ -356,8 +369,91 @@ async fn clear_button_with_black_frame(device: &Device, position: u8) -> Result<
         .await
 }
 
+fn schedule_debounced_flush(device_id: String) {
+    tokio::spawn(async move {
+        let generation = {
+            let mut generations = IMAGE_FLUSH_GENERATIONS.lock().await;
+            let generation = generations.entry(device_id.clone()).or_insert(0);
+            *generation += 1;
+            *generation
+        };
+
+        sleep(IMAGE_FLUSH_DEBOUNCE).await;
+
+        let should_flush = {
+            let generations = IMAGE_FLUSH_GENERATIONS.lock().await;
+            generations
+                .get(&device_id)
+                .is_some_and(|current_generation| *current_generation == generation)
+        };
+
+        if !should_flush {
+            return;
+        }
+
+        let image_lock = get_device_image_lock(&device_id).await;
+        let _image_guard = image_lock.lock().await;
+
+        let flush_result = {
+            let devices = DEVICES.read().await;
+            if let Some(device) = devices.get(&device_id) {
+                device.flush().await
+            } else {
+                return;
+            }
+        };
+
+        if let Err(err) = flush_result {
+            handle_error(&device_id, err).await;
+        }
+    });
+}
+
+async fn get_device_image_lock(device_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = DEVICE_IMAGE_LOCKS.lock().await;
+    locks
+        .entry(device_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn hash_image_payload(image: &Option<String>) -> Option<u64> {
+    image.as_ref().map(|payload| {
+        let mut hasher = DefaultHasher::new();
+        payload.hash(&mut hasher);
+        hasher.finish()
+    })
+}
+
+async fn is_duplicate_button_frame(device_id: &str, position: u8, hash: Option<u64>) -> bool {
+    let hashes = LAST_IMAGE_HASHES.lock().await;
+    hashes
+        .get(&(device_id.to_string(), position))
+        .is_some_and(|last_hash| *last_hash == hash)
+}
+
+async fn remember_button_frame(device_id: &str, position: u8, hash: Option<u64>) {
+    LAST_IMAGE_HASHES
+        .lock()
+        .await
+        .insert((device_id.to_string(), position), hash);
+}
+
+async fn clear_cached_frames(device_id: &str) {
+    LAST_IMAGE_HASHES
+        .lock()
+        .await
+        .retain(|(cached_device_id, _), _| cached_device_id != device_id);
+}
+
 /// Handles different combinations of "set image" event, including clearing the specific buttons and whole device
 pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(), MirajazzError> {
+    let device_id = evt.device.clone();
+    let mut should_batch_flush = false;
+    let mut should_flush_immediately = false;
+    let image_lock = get_device_image_lock(&device_id).await;
+    let _image_guard = image_lock.lock().await;
+
     if evt.position.is_some() {
         let mut redraw_guard = PROFILE_REDRAW_GUARD.lock().await;
         let now = Instant::now();
@@ -372,12 +468,19 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             }
         }
 
+        if let Some((last_key, last_pressed_at)) = redraw_guard.last_key_down {
+            let since_key_down = now.duration_since(last_pressed_at);
+            should_flush_immediately =
+                evt.position == Some(last_key) && since_key_down <= PRESSED_IMAGE_FLUSH_WINDOW;
+            should_batch_flush = since_key_down <= PROFILE_REDRAW_WINDOW && !should_flush_immediately;
+        }
+
         // A rapid burst of slot image updates soon after a key press strongly
         // suggests a page/profile redraw caused by that key. Keep extending the
         // suppression window while the redraw is still active.
         if redraw_guard.burst_count >= 5 {
             if let Some((last_key, last_pressed_at)) = redraw_guard.last_key_down {
-                if now.duration_since(last_pressed_at) <= Duration::from_millis(1500) {
+                if now.duration_since(last_pressed_at) <= PROFILE_REDRAW_WINDOW {
                     redraw_guard.suppress_key_until =
                         Some((last_key, now + Duration::from_millis(800)));
                 }
@@ -387,6 +490,12 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
 
     match (evt.position, evt.image) {
         (Some(position), Some(image)) => {
+            let image_hash = hash_image_payload(&Some(image.clone()));
+            if is_duplicate_button_frame(&device_id, position, image_hash).await {
+                log::debug!("Skipping duplicate image for button {}", position);
+                return Ok(());
+            }
+
             log::info!("Setting image for button {}", position);
 
             // OpenDeck sends image as a data url, so parse it using a library
@@ -409,17 +518,37 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             device
                 .set_button_image(opendeck_to_device(position), format, image)
                 .await?;
-            device.flush().await?;
+            remember_button_frame(&device_id, position, image_hash).await;
+            if should_flush_immediately {
+                device.flush().await?;
+            } else if should_batch_flush {
+                schedule_debounced_flush(device_id);
+            } else {
+                device.flush().await?;
+            }
         }
         (Some(position), None) => {
+            if is_duplicate_button_frame(&device_id, position, None).await {
+                log::debug!("Skipping duplicate clear for button {}", position);
+                return Ok(());
+            }
+
             clear_button_with_black_frame(device, position).await?;
-            device.flush().await?;
+            remember_button_frame(&device_id, position, None).await;
+            if should_flush_immediately {
+                device.flush().await?;
+            } else if should_batch_flush {
+                schedule_debounced_flush(device_id);
+            } else {
+                device.flush().await?;
+            }
         }
         (None, None) => {
             for position in 0..KEY_COUNT as u8 {
                 clear_button_with_black_frame(device, position).await?;
             }
-            device.flush().await?;
+            clear_cached_frames(&device_id).await;
+            schedule_debounced_flush(device_id);
         }
         _ => {}
     }
