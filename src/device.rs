@@ -106,7 +106,7 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
         outbound
             .register_device(
                 candidate.id.clone(),
-                candidate.kind.human_name(),
+                candidate.kind.human_name().to_string(),
                 ROW_COUNT as u8,
                 COL_COUNT as u8,
                 ENCODER_COUNT as u8,

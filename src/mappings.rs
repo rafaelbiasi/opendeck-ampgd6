@@ -64,20 +64,18 @@ impl Kind {
 
     /// There is no point relying on manufacturer/device names reported by the USB stack,
     /// so we return custom names for all the kinds of devices
-    pub fn human_name(&self) -> String {
+    pub fn human_name(&self) -> &'static str {
         match &self {
             Self::AMPGD6 => "FIFINE Ampligame D6",
         }
-        .to_string()
     }
 
     /// Because "v1" devices all share the same serial number, use custom suffix to be able to connect
     /// two devices with the different revisions at the same time
-    pub fn id_suffix(&self) -> String {
+    pub fn id_suffix(&self) -> &'static str {
         match &self {
             Self::AMPGD6 => "AMPGD6",
         }
-        .to_string()
     }
 }
 
