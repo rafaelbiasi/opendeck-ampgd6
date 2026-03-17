@@ -583,8 +583,16 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             }
         }
         (None, None) => {
-            for position in 0..KEY_COUNT as u8 {
-                clear_button_with_black_frame(device, position).await?;
+            if let Err(err) = device.clear_all_button_images().await {
+                log::warn!(
+                    "Failed to clear all button images natively for device {}, falling back to per-key black frames: {}",
+                    device_id,
+                    err
+                );
+
+                for position in 0..KEY_COUNT as u8 {
+                    clear_button_with_black_frame(device, position).await?;
+                }
             }
             image_state.last_image_hashes.fill(None);
             drop(image_state);
