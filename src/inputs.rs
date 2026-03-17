@@ -1,6 +1,9 @@
 use mirajazz::{error::MirajazzError, types::DeviceInput};
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::mappings::KEY_COUNT;
+
+static GLOBAL_BUTTON_STATE: AtomicU16 = AtomicU16::new(0);
 
 pub fn process_input(input: u8, state: u8) -> Result<DeviceInput, MirajazzError> {
     log::debug!("Processing input: {}, {}", input, state);
@@ -11,14 +14,14 @@ pub fn process_input(input: u8, state: u8) -> Result<DeviceInput, MirajazzError>
     }
 }
 
-fn read_button_states(states: &[u8]) -> Vec<bool> {
-    let mut bools = [false; KEY_COUNT];
+fn read_button_states(state_bitmask: u16) -> Vec<bool> {
+    let mut bools = vec![false; KEY_COUNT];
 
-    for i in 0..KEY_COUNT {
-        bools[i] = states[i + 1] != 0;
+    for (i, b) in bools.iter_mut().enumerate().take(KEY_COUNT) {
+        *b = (state_bitmask & (1 << i)) != 0;
     }
 
-    bools.into()
+    bools
 }
 
 /// Converts opendeck key index to device key index
@@ -83,18 +86,14 @@ pub fn device_to_opendeck(key: usize) -> usize {
 }
 
 fn read_button_press(input: u8, state: u8) -> Result<DeviceInput, MirajazzError> {
-    let mut button_states = [0u8; KEY_COUNT + 1];
-    button_states[0] = 0x01;
-
     if input == 0 {
-        return Ok(DeviceInput::ButtonStateChange(read_button_states(
-            &button_states,
-        )));
+        GLOBAL_BUTTON_STATE.store(0, Ordering::SeqCst);
+        return Ok(DeviceInput::ButtonStateChange(read_button_states(0)));
     }
 
     let pressed_index: usize = device_to_opendeck(input as usize);
-    // AMPGD6 reports state as: 1 = key down, 0 = key up
     let is_pressed = state != 0;
+    
     log::debug!(
         "Button event: device_index={}, opendeck_index={}, raw_state={}, is_pressed={}",
         input,
@@ -103,10 +102,15 @@ fn read_button_press(input: u8, state: u8) -> Result<DeviceInput, MirajazzError>
         is_pressed
     );
 
-    // `device_to_opendeck` is 0-based, so add 1
-    // I'll probably have to refactor all of this off-by-one stuff in this file, but that's a future me problem
+    let mut current_state = GLOBAL_BUTTON_STATE.load(Ordering::SeqCst);
+
     if pressed_index < KEY_COUNT {
-        button_states[pressed_index + 1] = if is_pressed { 1 } else { 0 };
+        if is_pressed {
+            current_state |= 1 << pressed_index;
+        } else {
+            current_state &= !(1 << pressed_index);
+        }
+        GLOBAL_BUTTON_STATE.store(current_state, Ordering::SeqCst);
     } else {
         log::warn!(
             "Button index {} out of range (max: {})",
@@ -116,7 +120,7 @@ fn read_button_press(input: u8, state: u8) -> Result<DeviceInput, MirajazzError>
     }
 
     Ok(DeviceInput::ButtonStateChange(read_button_states(
-        &button_states,
+        current_state,
     )))
 }
 

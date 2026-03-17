@@ -10,7 +10,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -22,7 +21,7 @@ use crate::{
     },
 };
 
-const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(35);
+const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(15);
 
 /// Initializes a device and listens for events
 pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
@@ -221,11 +220,23 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     use std::collections::HashSet;
 
     let mut pressed_buttons: HashSet<u8> = HashSet::new();
+    let mut last_repeat = std::time::Instant::now();
 
     loop {
         log::debug!("Reading updates...");
 
-        let updates = match reader.read(None).await {
+        let current_timeout = if pressed_buttons.is_empty() {
+            None
+        } else {
+            let elapsed = last_repeat.elapsed();
+            if elapsed >= Duration::from_millis(250) {
+                Some(Duration::from_millis(1))
+            } else {
+                Some(Duration::from_millis(250) - elapsed)
+            }
+        };
+
+        let updates = match reader.read(current_timeout).await {
             Ok(updates) => updates,
             Err(e) => {
                 if !handle_error(&candidate.id, e).await {
@@ -241,13 +252,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
 
             match &update {
                 DeviceStateUpdate::ButtonDown(key) => {
-                    if !pressed_buttons.insert(*key) {
-                        log::debug!(
-                            "Skipping repeated button_down while key {} is still held",
-                            key
-                        );
-                        continue;
-                    }
+                    pressed_buttons.insert(*key);
                 }
                 DeviceStateUpdate::ButtonUp(key) => {
                     pressed_buttons.remove(key);
@@ -297,6 +302,22 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
                         {
                             log::warn!("Failed to send encoder_change event: {}", err);
                         }
+                    }
+                }
+            }
+        }
+
+        if !pressed_buttons.is_empty() && last_repeat.elapsed() >= Duration::from_millis(250) {
+            last_repeat = std::time::Instant::now();
+            let id = candidate.id.clone();
+            if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
+                for &key in &pressed_buttons {
+                    log::trace!("Sending repeat key_down event: device_id={}, key={}", id, key);
+                    if let Err(err) = outbound.key_down(id.clone(), key).await {
+                        log::warn!(
+                            "Failed to send repeat key_down event: device_id={}, key={}, err={}",
+                            id, key, err
+                        );
                     }
                 }
             }
@@ -355,13 +376,9 @@ async fn debounced_flush_worker(
     mut flush_rx: mpsc::Receiver<()>,
 ) {
     while flush_rx.recv().await.is_some() {
-        loop {
-            match timeout(IMAGE_FLUSH_DEBOUNCE, flush_rx.recv()).await {
-                Ok(Some(_)) => continue,
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
+        tokio::time::sleep(IMAGE_FLUSH_DEBOUNCE).await;
+
+        while flush_rx.try_recv().is_ok() {}
 
         let Some(device) = DEVICES.read().await.get(&device_id).cloned() else {
             return;
