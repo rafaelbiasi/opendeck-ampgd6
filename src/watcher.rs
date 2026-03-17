@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     DEVICES, TOKENS, TRACKER,
-    device::device_task,
+    device::{cleanup_device_state, device_task},
     mappings::{CandidateDevice, DEVICE_NAMESPACE, Kind, QUERIES},
 };
 
@@ -124,12 +124,7 @@ pub async fn watcher_task(token: CancellationToken) -> Result<(), MirajazzError>
                         continue;
                     };
 
-                    if let Some(token) = TOKENS.write().await.remove(&id) {
-                        log::info!("Sending cancel request for {}", id);
-                        token.cancel();
-                    }
-
-                    DEVICES.write().await.remove(&id);
+                    cleanup_device_state(&id).await;
 
                     if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
                         outbound.deregister_device(id.clone()).await.ok();
