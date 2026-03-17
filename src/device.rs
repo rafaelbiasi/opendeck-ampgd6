@@ -372,13 +372,14 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             }
         }
 
-        // A rapid burst of slot image updates immediately after a key press strongly
-        // suggests a page/profile redraw caused by that key.
+        // A rapid burst of slot image updates soon after a key press strongly
+        // suggests a page/profile redraw caused by that key. Keep extending the
+        // suppression window while the redraw is still active.
         if redraw_guard.burst_count >= 5 {
             if let Some((last_key, last_pressed_at)) = redraw_guard.last_key_down {
-                if now.duration_since(last_pressed_at) <= Duration::from_millis(200) {
+                if now.duration_since(last_pressed_at) <= Duration::from_millis(1500) {
                     redraw_guard.suppress_key_until =
-                        Some((last_key, now + Duration::from_millis(500)));
+                        Some((last_key, now + Duration::from_millis(800)));
                 }
             }
         }
