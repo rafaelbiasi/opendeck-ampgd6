@@ -1,5 +1,8 @@
 use data_url::DataUrl;
-use image::load_from_memory_with_format;
+use image::{
+    DynamicImage, GenericImage, ImageBuffer, Rgb, RgbImage, imageops::FilterType,
+    load_from_memory_with_format,
+};
 use mirajazz::{device::Device, error::MirajazzError, state::DeviceStateUpdate};
 use openaction::{OUTBOUND_EVENT_MANAGER, SetImageEvent};
 use tokio_util::sync::CancellationToken;
@@ -249,6 +252,24 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     Ok(())
 }
 
+fn normalize_button_image(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
+    // Keep the whole icon visible and center it on a black canvas.
+    // This avoids clipping icons that are slightly off-center in the source artwork.
+    let resized = image.resize(width, height, FilterType::Lanczos3).to_rgb8();
+    let mut canvas: RgbImage = ImageBuffer::from_pixel(width, height, Rgb([0, 0, 0]));
+    let x = (width.saturating_sub(resized.width())) / 2;
+    let y = (height.saturating_sub(resized.height())) / 2;
+
+    let _ = canvas.copy_from(&resized, x, y);
+
+    DynamicImage::ImageRgb8(canvas)
+}
+
+fn blank_button_image(width: u32, height: u32) -> DynamicImage {
+    let blank: RgbImage = ImageBuffer::from_pixel(width, height, Rgb([0, 0, 0]));
+    DynamicImage::ImageRgb8(blank)
+}
+
 /// Handles different combinations of "set image" event, including clearing the specific buttons and whole device
 pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(), MirajazzError> {
     match (evt.position, evt.image) {
@@ -269,19 +290,25 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             let image = load_from_memory_with_format(body.as_slice(), image::ImageFormat::Jpeg)?;
 
             let kind = Kind::from_vid_pid(device.vid, device.pid).unwrap(); // Safe to unwrap here, because device is already filtered
+            let format = get_image_format_for_key(&kind, position);
+            let image = normalize_button_image(image, format.size.0 as u32, format.size.1 as u32);
 
             device
                 .set_button_image(
                     opendeck_to_device(position),
-                    get_image_format_for_key(&kind, position),
+                    format,
                     image,
                 )
                 .await?;
             device.flush().await?;
         }
         (Some(position), None) => {
+            let kind = Kind::from_vid_pid(device.vid, device.pid).unwrap();
+            let format = get_image_format_for_key(&kind, position);
+            let image = blank_button_image(format.size.0 as u32, format.size.1 as u32);
+
             device
-                .clear_button_image(opendeck_to_device(position))
+                .set_button_image(opendeck_to_device(position), format, image)
                 .await?;
             device.flush().await?;
         }
