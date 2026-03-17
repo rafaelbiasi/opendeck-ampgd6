@@ -9,11 +9,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    DEVICE_IMAGE_STATES, DEVICES, DeviceImageState, PROFILE_REDRAW_GUARD, TOKENS,
+    DEVICE_IMAGE_STATES, DEVICES, DeviceImageState, PROFILE_REDRAW_GUARD, TOKENS, TRACKER,
     inputs::opendeck_to_device,
     mappings::{
         COL_COUNT, CandidateDevice, ENCODER_COUNT, KEY_COUNT, Kind, ROW_COUNT,
@@ -391,24 +392,22 @@ async fn clear_button_with_black_frame(device: &Device, position: u8) -> Result<
         .await
 }
 
-fn schedule_debounced_flush(device_id: String) {
-    tokio::spawn(async move {
-        let image_state = get_device_image_state(&device_id).await;
-        let generation = {
-            let mut state = image_state.mutex.lock().await;
-            state.flush_generation += 1;
-            state.flush_generation
-        };
+async fn schedule_debounced_flush(device_id: String) {
+    let image_state = get_device_image_state(&device_id).await;
+    if image_state.flush_tx.try_send(()).is_err() {
+        log::debug!("Debounced flush already pending for device {}", device_id);
+    }
+}
 
-        sleep(IMAGE_FLUSH_DEBOUNCE).await;
-
-        let _image_guard = {
-            let state = image_state.mutex.lock().await;
-            if state.flush_generation != generation {
-                return;
+async fn debounced_flush_worker(device_id: String, mut flush_rx: mpsc::Receiver<()>) {
+    while flush_rx.recv().await.is_some() {
+        loop {
+            match timeout(IMAGE_FLUSH_DEBOUNCE, flush_rx.recv()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => break,
             }
-            state
-        };
+        }
 
         let flush_result = {
             let devices = DEVICES.read().await;
@@ -422,15 +421,26 @@ fn schedule_debounced_flush(device_id: String) {
         if let Err(err) = flush_result {
             handle_error(&device_id, err).await;
         }
-    });
+    }
 }
 
 async fn get_device_image_state(device_id: &str) -> Arc<DeviceImageState> {
     let mut states = DEVICE_IMAGE_STATES.lock().await;
-    states
-        .entry(device_id.to_string())
-        .or_insert_with(|| Arc::new(DeviceImageState::default()))
-        .clone()
+    if let Some(state) = states.get(device_id) {
+        return state.clone();
+    }
+
+    let (flush_tx, flush_rx) = mpsc::channel(1);
+    let state = Arc::new(DeviceImageState {
+        mutex: tokio::sync::Mutex::new(Default::default()),
+        flush_tx,
+    });
+
+    let tracker = TRACKER.lock().await.clone();
+    tracker.spawn(debounced_flush_worker(device_id.to_string(), flush_rx));
+    states.insert(device_id.to_string(), state.clone());
+
+    state
 }
 
 fn hash_image_payload(image: &Option<String>) -> Option<u64> {
@@ -550,7 +560,7 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
                 device.flush().await?;
             } else if should_batch_flush {
                 drop(image_state);
-                schedule_debounced_flush(device_id);
+                schedule_debounced_flush(device_id).await;
             } else {
                 device.flush().await?;
             }
@@ -567,7 +577,7 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
                 device.flush().await?;
             } else if should_batch_flush {
                 drop(image_state);
-                schedule_debounced_flush(device_id);
+                schedule_debounced_flush(device_id).await;
             } else {
                 device.flush().await?;
             }
@@ -578,7 +588,7 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             }
             image_state.last_image_hashes.fill(None);
             drop(image_state);
-            schedule_debounced_flush(device_id);
+            schedule_debounced_flush(device_id).await;
         }
         _ => {}
     }

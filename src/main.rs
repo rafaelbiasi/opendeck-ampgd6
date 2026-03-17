@@ -2,7 +2,7 @@ use device::{handle_error, handle_set_image};
 use mirajazz::device::Device;
 use openaction::*;
 use std::{collections::HashMap, sync::Arc, sync::LazyLock, time::Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use watcher::watcher_task;
 
@@ -34,25 +34,16 @@ pub struct ProfileRedrawGuard {
 
 pub struct DeviceImageState {
     pub mutex: Mutex<DeviceImageStateInner>,
+    pub flush_tx: mpsc::Sender<()>,
 }
 
 pub struct DeviceImageStateInner {
-    pub flush_generation: u64,
     pub last_image_hashes: [Option<u64>; mappings::KEY_COUNT],
-}
-
-impl Default for DeviceImageState {
-    fn default() -> Self {
-        Self {
-            mutex: Mutex::new(DeviceImageStateInner::default()),
-        }
-    }
 }
 
 impl Default for DeviceImageStateInner {
     fn default() -> Self {
         Self {
-            flush_generation: 0,
             last_image_hashes: [None; mappings::KEY_COUNT],
         }
     }
