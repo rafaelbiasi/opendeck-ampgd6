@@ -8,13 +8,13 @@ use openaction::{OUTBOUND_EVENT_MANAGER, SetImageEvent};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    DEVICE_IMAGE_STATES, DEVICES, DeviceImageState, PROFILE_REDRAW_GUARD, TOKENS, TRACKER,
+    DEVICE_IMAGE_STATES, DEVICES, DeviceImageState, TOKENS, TRACKER,
     inputs::opendeck_to_device,
     mappings::{
         COL_COUNT, CandidateDevice, ENCODER_COUNT, KEY_COUNT, Kind, ROW_COUNT,
@@ -23,8 +23,6 @@ use crate::{
 };
 
 const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(35);
-const PRESSED_IMAGE_FLUSH_WINDOW: Duration = Duration::from_millis(120);
-const PROFILE_REDRAW_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Initializes a device and listens for events
 pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
@@ -203,24 +201,9 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
 
     log::info!("Reader is ready for {}", candidate.id);
 
-    // Keep normal upstream behavior, but ignore repeated ButtonDown reports for a
-    // key that is still physically held. This targets the intermittent extra
-    // activation that can happen right after a profile switch redraw.
     use std::collections::HashSet;
-    use std::time::{Duration, Instant};
 
-    #[derive(Hash, PartialEq, Eq, Clone, Copy)]
-    enum EventKey {
-        ButtonDown(u8),
-        ButtonUp(u8),
-        EncoderDown(u8),
-        EncoderUp(u8),
-        EncoderTwist(u8, i16),
-    }
-
-    let mut last_events: HashSet<(EventKey, Instant)> = HashSet::new();
     let mut pressed_buttons: HashSet<u8> = HashSet::new();
-    let dedup_window = Duration::from_millis(500); // 500ms window for deduplication
 
     loop {
         log::info!("Reading updates...");
@@ -236,35 +219,11 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
             }
         };
 
-        // Clean up old events from deduplication cache
-        let now = Instant::now();
-        last_events.retain(|(_, time)| now.duration_since(*time) < dedup_window);
-
         for update in updates {
             log::info!("New update: {:#?}", update);
 
             match &update {
                 DeviceStateUpdate::ButtonDown(key) => {
-                    let now = Instant::now();
-                    let mut redraw_guard = PROFILE_REDRAW_GUARD.lock().await;
-                    let should_suppress =
-                        redraw_guard
-                            .suppress_key_until
-                            .is_some_and(|(suppressed_key, until)| {
-                                suppressed_key == *key && now < until
-                            });
-
-                    if should_suppress {
-                        log::info!(
-                            "Suppressing repeated key_down for key {} during profile redraw",
-                            key
-                        );
-                        continue;
-                    }
-
-                    redraw_guard.last_key_down = Some((*key, now));
-                    drop(redraw_guard);
-
                     if !pressed_buttons.insert(*key) {
                         log::debug!(
                             "Skipping repeated button_down while key {} is still held",
@@ -275,45 +234,9 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
                 }
                 DeviceStateUpdate::ButtonUp(key) => {
                     pressed_buttons.remove(key);
-
-                    let redraw_guard = PROFILE_REDRAW_GUARD.lock().await;
-                    if redraw_guard
-                        .suppress_key_until
-                        .is_some_and(|(suppressed_key, until)| {
-                            suppressed_key == *key && Instant::now() < until
-                        })
-                    {
-                        log::info!(
-                            "Suppressing paired key_up for key {} during profile redraw",
-                            key
-                        );
-                        continue;
-                    }
                 }
                 _ => {}
             }
-
-            // Create a key for deduplication
-            let event_key = match &update {
-                DeviceStateUpdate::ButtonDown(key) => EventKey::ButtonDown(*key),
-                DeviceStateUpdate::ButtonUp(key) => EventKey::ButtonUp(*key),
-                DeviceStateUpdate::EncoderDown(enc) => EventKey::EncoderDown(*enc),
-                DeviceStateUpdate::EncoderUp(enc) => EventKey::EncoderUp(*enc),
-                DeviceStateUpdate::EncoderTwist(enc, val) => {
-                    EventKey::EncoderTwist(*enc, *val as i16)
-                }
-            };
-
-            // Check for duplicates (same event type and key/encoder within the dedup window)
-            let is_duplicate = last_events.iter().any(|(key, _)| *key == event_key);
-
-            if is_duplicate {
-                log::debug!("Skipping duplicate event: {:#?}", update);
-                continue;
-            }
-
-            // Add to deduplication cache
-            last_events.insert((event_key, now));
 
             let id = candidate.id.clone();
 
@@ -459,45 +382,8 @@ fn hash_image_payload(image: Option<&str>) -> Option<u64> {
 /// Handles different combinations of "set image" event, including clearing the specific buttons and whole device
 pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(), MirajazzError> {
     let device_id = evt.device.clone();
-    let mut should_batch_flush = false;
-    let mut should_flush_immediately = false;
     let image_state = get_device_image_state(&device_id).await;
     let mut image_state = image_state.mutex.lock().await;
-
-    if evt.position.is_some() {
-        let mut redraw_guard = PROFILE_REDRAW_GUARD.lock().await;
-        let now = Instant::now();
-
-        match redraw_guard.burst_started_at {
-            Some(started_at) if now.duration_since(started_at) <= Duration::from_millis(400) => {
-                redraw_guard.burst_count += 1;
-            }
-            _ => {
-                redraw_guard.burst_started_at = Some(now);
-                redraw_guard.burst_count = 1;
-            }
-        }
-
-        if let Some((last_key, last_pressed_at)) = redraw_guard.last_key_down {
-            let since_key_down = now.duration_since(last_pressed_at);
-            should_flush_immediately =
-                evt.position == Some(last_key) && since_key_down <= PRESSED_IMAGE_FLUSH_WINDOW;
-            should_batch_flush =
-                since_key_down <= PROFILE_REDRAW_WINDOW && !should_flush_immediately;
-        }
-
-        // A rapid burst of slot image updates soon after a key press strongly
-        // suggests a page/profile redraw caused by that key. Keep extending the
-        // suppression window while the redraw is still active.
-        if redraw_guard.burst_count >= 5 {
-            if let Some((last_key, last_pressed_at)) = redraw_guard.last_key_down {
-                if now.duration_since(last_pressed_at) <= PROFILE_REDRAW_WINDOW {
-                    redraw_guard.suppress_key_until =
-                        Some((last_key, now + Duration::from_millis(800)));
-                }
-            }
-        }
-    }
 
     match (evt.position, evt.image) {
         (Some(position), Some(image)) => {
@@ -561,14 +447,8 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
                 .set_button_image(opendeck_to_device(position), format, image)
                 .await?;
             image_state.last_image_hashes[position as usize] = image_hash;
-            if should_flush_immediately {
-                device.flush().await?;
-            } else if should_batch_flush {
-                drop(image_state);
-                schedule_debounced_flush(device_id).await;
-            } else {
-                device.flush().await?;
-            }
+            drop(image_state);
+            schedule_debounced_flush(device_id).await;
         }
         (Some(position), None) => {
             if image_state.last_image_hashes[position as usize].is_none() {
@@ -578,14 +458,8 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
 
             clear_button_with_black_frame(device, position).await?;
             image_state.last_image_hashes[position as usize] = None;
-            if should_flush_immediately {
-                device.flush().await?;
-            } else if should_batch_flush {
-                drop(image_state);
-                schedule_debounced_flush(device_id).await;
-            } else {
-                device.flush().await?;
-            }
+            drop(image_state);
+            schedule_debounced_flush(device_id).await;
         }
         (None, None) => {
             if let Err(err) = device.clear_all_button_images().await {
