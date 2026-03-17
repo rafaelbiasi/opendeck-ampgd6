@@ -29,11 +29,8 @@ pub const QUERIES: [DeviceQuery; 1] = [AMPGD6_QUERY];
 pub fn get_image_format_for_key(kind: &Kind, _key: u8) -> ImageFormat {
     // Larger frames get cropped by the device firmware.
     // Keep the conservative size and let the renderer center the source image.
-    let size = if kind.protocol_version() == 1 {
-        (100, 100)
-    } else {
-        (100, 100)
-    };
+    let _ = kind;
+    let size = (100, 100);
 
     ImageFormat {
         mode: ImageMode::JPEG,

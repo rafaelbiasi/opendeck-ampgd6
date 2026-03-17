@@ -22,14 +22,14 @@ use crate::{
     },
 };
 
-const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(80);
+const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(35);
 
 /// Initializes a device and listens for events
 pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
     log::info!("Running device task for {:?}", candidate);
 
     // Wrap in a closure so we can use `?` operator
-    let device = async || -> Result<Device, MirajazzError> {
+    let device = async {
         log::info!("Connecting to device...");
         let device = connect(&candidate).await?;
         log::info!("Device connected successfully");
@@ -82,7 +82,7 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
         }
 
         Ok(device)
-    }()
+    }
     .await;
 
     let device: Device = match device {
@@ -100,8 +100,9 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
     };
 
     log::info!("Registering device {}", candidate.id);
+    let mut registered = false;
     if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
-        outbound
+        match outbound
             .register_device(
                 candidate.id.clone(),
                 candidate.kind.human_name().to_string(),
@@ -111,10 +112,25 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
                 0,
             )
             .await
-            .unwrap();
+        {
+            Ok(()) => registered = true,
+            Err(err) => log::warn!("Failed to register device {}: {}", candidate.id, err),
+        }
     }
 
-    DEVICES.write().await.insert(candidate.id.clone(), device);
+    if !registered {
+        log::error!(
+            "Device {} could not be registered with OpenDeck, aborting device task",
+            candidate.id
+        );
+        device.shutdown().await.ok();
+        return;
+    }
+
+    DEVICES
+        .write()
+        .await
+        .insert(candidate.id.clone(), Arc::new(device));
 
     tokio::select! {
         _ = device_events_task(&candidate) => {},
@@ -123,7 +139,7 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
 
     log::info!("Shutting down device {:?}", candidate);
 
-    if let Some(device) = DEVICES.read().await.get(&candidate.id) {
+    if let Some(device) = DEVICES.read().await.get(&candidate.id).cloned() {
         device.shutdown().await.ok();
     }
 
@@ -141,7 +157,9 @@ pub async fn handle_error(id: &String, err: MirajazzError) -> bool {
 
     log::info!("Deregistering device {}", id);
     if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
-        outbound.deregister_device(id.clone()).await.unwrap();
+        if let Err(err) = outbound.deregister_device(id.clone()).await {
+            log::warn!("Failed to deregister device {}: {}", id, err);
+        }
     }
 
     cleanup_device_state(id).await;
@@ -185,12 +203,11 @@ pub async fn connect(candidate: &CandidateDevice) -> Result<Device, MirajazzErro
 async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzError> {
     log::info!("Connecting to {} for incoming events", candidate.id);
 
-    let devices_lock = DEVICES.read().await;
-    let mut reader = match devices_lock.get(&candidate.id) {
+    let device = DEVICES.read().await.get(&candidate.id).cloned();
+    let mut reader = match device {
         Some(device) => device.get_reader(crate::inputs::process_input),
         None => return Ok(()),
     };
-    drop(devices_lock);
 
     // Force event reader to use protocol 3 while keeping device write protocol unchanged.
     if let Some(reader_mut) = std::sync::Arc::get_mut(&mut reader) {
@@ -206,7 +223,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     let mut pressed_buttons: HashSet<u8> = HashSet::new();
 
     loop {
-        log::info!("Reading updates...");
+        log::debug!("Reading updates...");
 
         let updates = match reader.read(None).await {
             Ok(updates) => updates,
@@ -220,7 +237,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
         };
 
         for update in updates {
-            log::info!("New update: {:#?}", update);
+            log::debug!("New update: {:#?}", update);
 
             match &update {
                 DeviceStateUpdate::ButtonDown(key) => {
@@ -243,7 +260,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
             if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
                 match update {
                     DeviceStateUpdate::ButtonDown(key) => {
-                        log::info!("Sending key_down event: device_id={}, key={}", id, key);
+                        log::debug!("Sending key_down event: device_id={}, key={}", id, key);
                         if let Err(err) = outbound.key_down(id.clone(), key).await {
                             log::warn!(
                                 "Failed to send key_down event: device_id={}, key={}, err={}",
@@ -254,7 +271,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
                         }
                     }
                     DeviceStateUpdate::ButtonUp(key) => {
-                        log::info!("Sending key_up event: device_id={}, key={}", id, key);
+                        log::debug!("Sending key_up event: device_id={}, key={}", id, key);
                         if let Err(err) = outbound.key_up(id.clone(), key).await {
                             log::warn!(
                                 "Failed to send key_up event: device_id={}, key={}, err={}",
@@ -265,16 +282,21 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
                         }
                     }
                     DeviceStateUpdate::EncoderDown(encoder) => {
-                        outbound.encoder_down(id, encoder).await.unwrap();
+                        if let Err(err) = outbound.encoder_down(id, encoder).await {
+                            log::warn!("Failed to send encoder_down event: {}", err);
+                        }
                     }
                     DeviceStateUpdate::EncoderUp(encoder) => {
-                        outbound.encoder_up(id, encoder).await.unwrap();
+                        if let Err(err) = outbound.encoder_up(id, encoder).await {
+                            log::warn!("Failed to send encoder_up event: {}", err);
+                        }
                     }
                     DeviceStateUpdate::EncoderTwist(encoder, val) => {
-                        outbound
-                            .encoder_change(id, encoder, val as i16)
-                            .await
-                            .unwrap();
+                        if let Err(err) =
+                            outbound.encoder_change(id, encoder, val as i16).await
+                        {
+                            log::warn!("Failed to send encoder_change event: {}", err);
+                        }
                     }
                 }
             }
@@ -327,7 +349,11 @@ async fn schedule_debounced_flush(device_id: String) {
     }
 }
 
-async fn debounced_flush_worker(device_id: String, mut flush_rx: mpsc::Receiver<()>) {
+async fn debounced_flush_worker(
+    device_id: String,
+    image_state: Arc<DeviceImageState>,
+    mut flush_rx: mpsc::Receiver<()>,
+) {
     while flush_rx.recv().await.is_some() {
         loop {
             match timeout(IMAGE_FLUSH_DEBOUNCE, flush_rx.recv()).await {
@@ -337,14 +363,11 @@ async fn debounced_flush_worker(device_id: String, mut flush_rx: mpsc::Receiver<
             }
         }
 
-        let flush_result = {
-            let devices = DEVICES.read().await;
-            if let Some(device) = devices.get(&device_id) {
-                device.flush().await
-            } else {
-                return;
-            }
+        let Some(device) = DEVICES.read().await.get(&device_id).cloned() else {
+            return;
         };
+        let _io_guard = image_state.io_mutex.lock().await;
+        let flush_result = device.flush().await;
 
         if let Err(err) = flush_result {
             handle_error(&device_id, err).await;
@@ -353,19 +376,31 @@ async fn debounced_flush_worker(device_id: String, mut flush_rx: mpsc::Receiver<
 }
 
 async fn get_device_image_state(device_id: &str) -> Arc<DeviceImageState> {
-    let mut states = DEVICE_IMAGE_STATES.lock().await;
-    if let Some(state) = states.get(device_id) {
-        return state.clone();
+    {
+        let states = DEVICE_IMAGE_STATES.lock().await;
+        if let Some(state) = states.get(device_id) {
+            return state.clone();
+        }
     }
 
     let (flush_tx, flush_rx) = mpsc::channel(1);
     let state = Arc::new(DeviceImageState {
-        mutex: tokio::sync::Mutex::new(Default::default()),
+        state_mutex: tokio::sync::Mutex::new(Default::default()),
+        io_mutex: tokio::sync::Mutex::new(()),
         flush_tx,
     });
 
     let tracker = TRACKER.lock().await.clone();
-    tracker.spawn(debounced_flush_worker(device_id.to_string(), flush_rx));
+    tracker.spawn(debounced_flush_worker(
+        device_id.to_string(),
+        state.clone(),
+        flush_rx,
+    ));
+
+    let mut states = DEVICE_IMAGE_STATES.lock().await;
+    if let Some(existing_state) = states.get(device_id) {
+        return existing_state.clone();
+    }
     states.insert(device_id.to_string(), state.clone());
 
     state
@@ -379,89 +414,149 @@ fn hash_image_payload(image: Option<&str>) -> Option<u64> {
     })
 }
 
+fn validate_button_position(position: u8) -> Result<usize, MirajazzError> {
+    let index = position as usize;
+    if index < KEY_COUNT {
+        Ok(index)
+    } else {
+        log::warn!(
+            "Ignoring out-of-range button position {} (max {})",
+            position,
+            KEY_COUNT - 1
+        );
+        Err(MirajazzError::BadData)
+    }
+}
+
+fn decode_button_image(
+    device: &Device,
+    device_id: &str,
+    position: u8,
+    image: &str,
+) -> Result<(mirajazz::types::ImageFormat, DynamicImage), MirajazzError> {
+    let url = match DataUrl::process(image) {
+        Ok(url) => url,
+        Err(err) => {
+            log::error!(
+                "Received malformed data URL for device {}, button {}: {}",
+                device_id,
+                position,
+                err
+            );
+            return Err(MirajazzError::BadData);
+        }
+    };
+    let (body, _fragment) = match url.decode_to_vec() {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            log::error!(
+                "Failed to decode data URL for device {}, button {}: {}",
+                device_id,
+                position,
+                err
+            );
+            return Err(MirajazzError::BadData);
+        }
+    };
+
+    if url.mime_type().subtype != "jpeg" {
+        log::error!("Incorrect mime type: {}", url.mime_type());
+        return Err(MirajazzError::BadData);
+    }
+
+    let image = load_from_memory_with_format(body.as_slice(), image::ImageFormat::Jpeg)?;
+    let kind = Kind::from_vid_pid(device.vid, device.pid).ok_or_else(|| {
+        log::error!(
+            "Unable to resolve device kind while setting image: vid={:#06x}, pid={:#06x}, device_id={}, button={}",
+            device.vid,
+            device.pid,
+            device_id,
+            position
+        );
+        MirajazzError::BadData
+    })?;
+    let format = get_image_format_for_key(&kind, position);
+    let image = normalize_button_image(image, format.size.0 as u32, format.size.1 as u32);
+
+    Ok((format, image))
+}
+
+async fn clear_pending_image_hash(image_state: &Arc<DeviceImageState>, index: usize, image_hash: Option<u64>) {
+    let mut image_state = image_state.state_mutex.lock().await;
+    if image_state.pending_image_hashes[index] == image_hash {
+        image_state.pending_image_hashes[index] = None;
+    }
+}
+
 /// Handles different combinations of "set image" event, including clearing the specific buttons and whole device
 pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(), MirajazzError> {
     let device_id = evt.device.clone();
     let image_state = get_device_image_state(&device_id).await;
-    let mut image_state = image_state.mutex.lock().await;
 
     match (evt.position, evt.image) {
         (Some(position), Some(image)) => {
+            let index = validate_button_position(position)?;
             let image_hash = hash_image_payload(Some(image.as_str()));
-            if image_state.last_image_hashes[position as usize] == image_hash {
-                log::debug!("Skipping duplicate image for button {}", position);
-                return Ok(());
+            {
+                let mut image_state = image_state.state_mutex.lock().await;
+                if image_state.last_image_hashes[index] == image_hash
+                    || image_state.pending_image_hashes[index] == image_hash
+                {
+                    log::debug!("Skipping duplicate image for button {}", position);
+                    return Ok(());
+                }
+                image_state.pending_image_hashes[index] = image_hash;
             }
 
-            log::info!("Setting image for button {}", position);
-
-            // OpenDeck sends image as a data url, so parse it using a library
-            let url = match DataUrl::process(image.as_str()) {
-                Ok(url) => url,
-                Err(err) => {
-                    log::error!(
-                        "Received malformed data URL for device {}, button {}: {}",
-                        device_id,
-                        position,
-                        err
-                    );
-                    return Err(MirajazzError::BadData);
-                }
-            };
-            let (body, _fragment) = match url.decode_to_vec() {
+            let (format, image) = match decode_button_image(device, &device_id, position, image.as_str()) {
                 Ok(decoded) => decoded,
+                Err(MirajazzError::BadData) => {
+                    clear_pending_image_hash(&image_state, index, image_hash).await;
+                    return Ok(());
+                }
                 Err(err) => {
-                    log::error!(
-                        "Failed to decode data URL for device {}, button {}: {}",
-                        device_id,
-                        position,
-                        err
-                    );
-                    return Err(MirajazzError::BadData);
+                    clear_pending_image_hash(&image_state, index, image_hash).await;
+                    return Err(err);
                 }
             };
-
-            // Allow only image/jpeg mime for now
-            if url.mime_type().subtype != "jpeg" {
-                log::error!("Incorrect mime type: {}", url.mime_type());
-
-                return Ok(()); // Not a fatal error, enough to just log it
-            }
-
-            let image = load_from_memory_with_format(body.as_slice(), image::ImageFormat::Jpeg)?;
-
-            let kind = Kind::from_vid_pid(device.vid, device.pid).ok_or_else(|| {
-                log::error!(
-                    "Unable to resolve device kind while setting image: vid={:#06x}, pid={:#06x}, device_id={}, button={}",
-                    device.vid,
-                    device.pid,
-                    device_id,
-                    position
-                );
-                MirajazzError::BadData
-            })?;
-            let format = get_image_format_for_key(&kind, position);
-            let image = normalize_button_image(image, format.size.0 as u32, format.size.1 as u32);
-
-            device
+            let _io_guard = image_state.io_mutex.lock().await;
+            if let Err(err) = device
                 .set_button_image(opendeck_to_device(position), format, image)
-                .await?;
-            image_state.last_image_hashes[position as usize] = image_hash;
-            drop(image_state);
+                .await
+            {
+                drop(_io_guard);
+                clear_pending_image_hash(&image_state, index, image_hash).await;
+                return Err(err);
+            }
+            drop(_io_guard);
+            let mut image_state = image_state.state_mutex.lock().await;
+            image_state.last_image_hashes[index] = image_hash;
+            image_state.pending_image_hashes[index] = None;
             schedule_debounced_flush(device_id).await;
         }
         (Some(position), None) => {
-            if image_state.last_image_hashes[position as usize].is_none() {
-                log::debug!("Skipping duplicate clear for button {}", position);
-                return Ok(());
+            let index = validate_button_position(position)?;
+            {
+                let mut image_state = image_state.state_mutex.lock().await;
+                if image_state.last_image_hashes[index].is_none()
+                    && image_state.pending_image_hashes[index].is_none()
+                {
+                    log::debug!("Skipping duplicate clear for button {}", position);
+                    return Ok(());
+                }
+                image_state.pending_image_hashes[index] = None;
             }
 
+            let _io_guard = image_state.io_mutex.lock().await;
             clear_button_with_black_frame(device, position).await?;
-            image_state.last_image_hashes[position as usize] = None;
-            drop(image_state);
+            drop(_io_guard);
+            let mut image_state = image_state.state_mutex.lock().await;
+            image_state.last_image_hashes[index] = None;
+            image_state.pending_image_hashes[index] = None;
             schedule_debounced_flush(device_id).await;
         }
         (None, None) => {
+            let _io_guard = image_state.io_mutex.lock().await;
             if let Err(err) = device.clear_all_button_images().await {
                 log::warn!(
                     "Failed to clear all button images natively for device {}, falling back to per-key black frames: {}",
@@ -473,8 +568,10 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
                     clear_button_with_black_frame(device, position).await?;
                 }
             }
+            drop(_io_guard);
+            let mut image_state = image_state.state_mutex.lock().await;
             image_state.last_image_hashes.fill(None);
-            drop(image_state);
+            image_state.pending_image_hashes.fill(None);
             schedule_debounced_flush(device_id).await;
         }
         _ => {}

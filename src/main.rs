@@ -14,7 +14,7 @@ mod inputs;
 mod mappings;
 mod watcher;
 
-pub static DEVICES: LazyLock<RwLock<HashMap<String, Device>>> =
+pub static DEVICES: LazyLock<RwLock<HashMap<String, Arc<Device>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 pub static TOKENS: LazyLock<RwLock<HashMap<String, CancellationToken>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -23,18 +23,21 @@ pub static DEVICE_IMAGE_STATES: LazyLock<Mutex<HashMap<String, Arc<DeviceImageSt
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub struct DeviceImageState {
-    pub mutex: Mutex<DeviceImageStateInner>,
+    pub state_mutex: Mutex<DeviceImageStateInner>,
+    pub io_mutex: Mutex<()>,
     pub flush_tx: mpsc::Sender<()>,
 }
 
 pub struct DeviceImageStateInner {
     pub last_image_hashes: [Option<u64>; mappings::KEY_COUNT],
+    pub pending_image_hashes: [Option<u64>; mappings::KEY_COUNT],
 }
 
 impl Default for DeviceImageStateInner {
     fn default() -> Self {
         Self {
             last_image_hashes: [None; mappings::KEY_COUNT],
+            pending_image_hashes: [None; mappings::KEY_COUNT],
         }
     }
 }
@@ -75,8 +78,10 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {
 
         let id = event.device.clone();
 
-        if let Some(device) = DEVICES.read().await.get(&event.device) {
-            handle_set_image(device, event)
+        let device = DEVICES.read().await.get(&event.device).cloned();
+
+        if let Some(device) = device {
+            handle_set_image(device.as_ref(), event)
                 .await
                 .map_err(async |err| handle_error(&id, err).await)
                 .ok();
@@ -96,7 +101,9 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {
 
         let id = event.device.clone();
 
-        if let Some(device) = DEVICES.read().await.get(&event.device) {
+        let device = DEVICES.read().await.get(&event.device).cloned();
+
+        if let Some(device) = device {
             device
                 .set_brightness(event.brightness)
                 .await

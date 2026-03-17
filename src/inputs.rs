@@ -74,7 +74,7 @@ pub fn device_to_opendeck(key: usize) -> usize {
     // For ss550, this works because the device sends linear indexes for events
     // even though images use a mapped layout
     let result = key - 1;
-    log::info!(
+    log::debug!(
         "device_to_opendeck: device_index_1based={}, opendeck_index={}",
         key,
         result
@@ -95,7 +95,7 @@ fn read_button_press(input: u8, state: u8) -> Result<DeviceInput, MirajazzError>
     let pressed_index: usize = device_to_opendeck(input as usize);
     // AMPGD6 reports state as: 1 = key down, 0 = key up
     let is_pressed = state != 0;
-    log::info!(
+    log::debug!(
         "Button event: device_index={}, opendeck_index={}, raw_state={}, is_pressed={}",
         input,
         pressed_index,
@@ -118,4 +118,25 @@ fn read_button_press(input: u8, state: u8) -> Result<DeviceInput, MirajazzError>
     Ok(DeviceInput::ButtonStateChange(read_button_states(
         &button_states,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{device_to_opendeck, opendeck_to_device};
+
+    #[test]
+    fn image_mapping_matches_expected_layout() {
+        let expected = [10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4];
+
+        for (opendeck, device) in expected.into_iter().enumerate() {
+            assert_eq!(opendeck_to_device(opendeck as u8), device);
+        }
+    }
+
+    #[test]
+    fn event_mapping_is_linear_one_based() {
+        for device_index in 1..=15 {
+            assert_eq!(device_to_opendeck(device_index), device_index - 1);
+        }
+    }
 }
