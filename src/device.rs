@@ -443,8 +443,8 @@ async fn get_device_image_state(device_id: &str) -> Arc<DeviceImageState> {
     state
 }
 
-fn hash_image_payload(image: &Option<String>) -> Option<u64> {
-    image.as_ref().map(|payload| {
+fn hash_image_payload(image: Option<&str>) -> Option<u64> {
+    image.map(|payload| {
         let mut hasher = DefaultHasher::new();
         payload.hash(&mut hasher);
         hasher.finish()
@@ -496,7 +496,7 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
 
     match (evt.position, evt.image) {
         (Some(position), Some(image)) => {
-            let image_hash = hash_image_payload(&Some(image.clone()));
+            let image_hash = hash_image_payload(Some(image.as_str()));
             if image_state.last_image_hashes[position as usize] == image_hash {
                 log::debug!("Skipping duplicate image for button {}", position);
                 return Ok(());
