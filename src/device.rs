@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(35);
+const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(80);
 
 /// Initializes a device and listens for events
 pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
