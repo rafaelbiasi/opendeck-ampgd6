@@ -93,17 +93,20 @@ fn read_button_press(input: u8, state: u8) -> Result<DeviceInput, MirajazzError>
     }
 
     let pressed_index: usize = device_to_opendeck(input as usize);
+    // AMPGD6 reports state as: 1 = key down, 0 = key up
+    let is_pressed = state != 0;
     log::info!(
-        "Button press: device_index={}, opendeck_index={}, state={}",
+        "Button event: device_index={}, opendeck_index={}, raw_state={}, is_pressed={}",
         input,
         pressed_index,
-        state
+        state,
+        is_pressed
     );
 
     // `device_to_opendeck` is 0-based, so add 1
     // I'll probably have to refactor all of this off-by-one stuff in this file, but that's a future me problem
     if pressed_index < KEY_COUNT {
-        button_states[pressed_index + 1] = state;
+        button_states[pressed_index + 1] = if is_pressed { 1 } else { 0 };
     } else {
         log::warn!(
             "Button index {} out of range (max: {})",

@@ -188,11 +188,16 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     log::info!("Connecting to {} for incoming events", candidate.id);
 
     let devices_lock = DEVICES.read().await;
-    let reader = match devices_lock.get(&candidate.id) {
+    let mut reader = match devices_lock.get(&candidate.id) {
         Some(device) => device.get_reader(crate::inputs::process_input),
         None => return Ok(()),
     };
     drop(devices_lock);
+
+    // Force event reader to use protocol 3 while keeping device write protocol unchanged.
+    if let Some(reader_mut) = std::sync::Arc::get_mut(&mut reader) {
+        reader_mut.protocol_version = 3;
+    }
 
     log::info!("Connected to {} for incoming events", candidate.id);
 
