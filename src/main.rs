@@ -21,11 +21,7 @@ pub static TOKENS: LazyLock<RwLock<HashMap<String, CancellationToken>>> =
 pub static TRACKER: LazyLock<Mutex<TaskTracker>> = LazyLock::new(|| Mutex::new(TaskTracker::new()));
 pub static PROFILE_REDRAW_GUARD: LazyLock<Mutex<ProfileRedrawGuard>> =
     LazyLock::new(|| Mutex::new(ProfileRedrawGuard::default()));
-pub static IMAGE_FLUSH_GENERATIONS: LazyLock<Mutex<HashMap<String, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-pub static DEVICE_IMAGE_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-pub static LAST_IMAGE_HASHES: LazyLock<Mutex<HashMap<(String, u8), Option<u64>>>> =
+pub static DEVICE_IMAGE_STATES: LazyLock<Mutex<HashMap<String, Arc<DeviceImageState>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Default)]
@@ -34,6 +30,32 @@ pub struct ProfileRedrawGuard {
     pub burst_count: usize,
     pub burst_started_at: Option<Instant>,
     pub suppress_key_until: Option<(u8, Instant)>,
+}
+
+pub struct DeviceImageState {
+    pub mutex: Mutex<DeviceImageStateInner>,
+}
+
+pub struct DeviceImageStateInner {
+    pub flush_generation: u64,
+    pub last_image_hashes: [Option<u64>; mappings::KEY_COUNT],
+}
+
+impl Default for DeviceImageState {
+    fn default() -> Self {
+        Self {
+            mutex: Mutex::new(DeviceImageStateInner::default()),
+        }
+    }
+}
+
+impl Default for DeviceImageStateInner {
+    fn default() -> Self {
+        Self {
+            flush_generation: 0,
+            last_image_hashes: [None; mappings::KEY_COUNT],
+        }
+    }
 }
 
 struct GlobalEventHandler {}

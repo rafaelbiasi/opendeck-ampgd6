@@ -12,13 +12,13 @@ pub fn process_input(input: u8, state: u8) -> Result<DeviceInput, MirajazzError>
 }
 
 fn read_button_states(states: &[u8]) -> Vec<bool> {
-    let mut bools = vec![];
+    let mut bools = [false; KEY_COUNT];
 
     for i in 0..KEY_COUNT {
-        bools.push(states[i + 1] != 0);
+        bools[i] = states[i + 1] != 0;
     }
 
-    bools
+    bools.into()
 }
 
 /// Converts opendeck key index to device key index
@@ -83,8 +83,8 @@ pub fn device_to_opendeck(key: usize) -> usize {
 }
 
 fn read_button_press(input: u8, state: u8) -> Result<DeviceInput, MirajazzError> {
-    let mut button_states = vec![0x01];
-    button_states.extend(vec![0u8; KEY_COUNT + 1]);
+    let mut button_states = [0u8; KEY_COUNT + 1];
+    button_states[0] = 0x01;
 
     if input == 0 {
         return Ok(DeviceInput::ButtonStateChange(read_button_states(
