@@ -118,17 +118,17 @@ async fn shutdown() {
     }
 }
 
-async fn connect() -> Result<(), Box<dyn std::error::Error>> {
+async fn connect() -> EventHandlerResult {
     init_plugin(GlobalEventHandler {}, ActionEventHandler {})
         .await
         .map_err(|error| {
             log::error!("Failed to initialize plugin: {}", error);
-            Box::new(error) as Box<dyn std::error::Error>
+            error
         })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-async fn sigterm() -> Result<(), Box<dyn std::error::Error>> {
+async fn sigterm() -> EventHandlerResult {
     let mut sig = signal(SignalKind::terminate())?;
 
     sig.recv().await;
@@ -137,13 +137,13 @@ async fn sigterm() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "windows")]
-async fn sigterm() -> Result<(), Box<dyn std::error::Error>> {
+async fn sigterm() -> EventHandlerResult {
     tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> EventHandlerResult {
     simplelog::TermLogger::init(
         simplelog::LevelFilter::Info,
         simplelog::Config::default(),
