@@ -152,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         simplelog::TerminalMode::Stdout,
         simplelog::ColorChoice::Never,
     )
-    .unwrap();
+    .unwrap_or_else(|err| eprintln!("Failed to initialize logger: {err}"));
 
     tokio::select! {
         _ = connect() => {},

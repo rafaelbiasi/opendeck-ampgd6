@@ -14,8 +14,8 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    DEVICE_IMAGE_LOCKS, DEVICES, IMAGE_FLUSH_GENERATIONS, LAST_IMAGE_HASHES,
-    PROFILE_REDRAW_GUARD, TOKENS,
+    DEVICE_IMAGE_LOCKS, DEVICES, IMAGE_FLUSH_GENERATIONS, LAST_IMAGE_HASHES, PROFILE_REDRAW_GUARD,
+    TOKENS,
     inputs::opendeck_to_device,
     mappings::{
         COL_COUNT, CandidateDevice, ENCODER_COUNT, KEY_COUNT, Kind, ROW_COUNT,
@@ -315,11 +315,25 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
                 match update {
                     DeviceStateUpdate::ButtonDown(key) => {
                         log::info!("Sending key_down event: device_id={}, key={}", id, key);
-                        outbound.key_down(id.clone(), key).await.unwrap();
+                        if let Err(err) = outbound.key_down(id.clone(), key).await {
+                            log::warn!(
+                                "Failed to send key_down event: device_id={}, key={}, err={}",
+                                id,
+                                key,
+                                err
+                            );
+                        }
                     }
                     DeviceStateUpdate::ButtonUp(key) => {
                         log::info!("Sending key_up event: device_id={}, key={}", id, key);
-                        outbound.key_up(id.clone(), key).await.unwrap();
+                        if let Err(err) = outbound.key_up(id.clone(), key).await {
+                            log::warn!(
+                                "Failed to send key_up event: device_id={}, key={}, err={}",
+                                id,
+                                key,
+                                err
+                            );
+                        }
                     }
                     DeviceStateUpdate::EncoderDown(encoder) => {
                         outbound.encoder_down(id, encoder).await.unwrap();
@@ -360,7 +374,15 @@ fn blank_button_image(width: u32, height: u32) -> DynamicImage {
 }
 
 async fn clear_button_with_black_frame(device: &Device, position: u8) -> Result<(), MirajazzError> {
-    let kind = Kind::from_vid_pid(device.vid, device.pid).unwrap();
+    let kind = Kind::from_vid_pid(device.vid, device.pid).ok_or_else(|| {
+        log::error!(
+            "Unable to resolve device kind while clearing button: vid={:#06x}, pid={:#06x}, position={}",
+            device.vid,
+            device.pid,
+            position
+        );
+        MirajazzError::BadData
+    })?;
     let format = get_image_format_for_key(&kind, position);
     let image = blank_button_image(format.size.0 as u32, format.size.1 as u32);
 
@@ -472,7 +494,8 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             let since_key_down = now.duration_since(last_pressed_at);
             should_flush_immediately =
                 evt.position == Some(last_key) && since_key_down <= PRESSED_IMAGE_FLUSH_WINDOW;
-            should_batch_flush = since_key_down <= PROFILE_REDRAW_WINDOW && !should_flush_immediately;
+            should_batch_flush =
+                since_key_down <= PROFILE_REDRAW_WINDOW && !should_flush_immediately;
         }
 
         // A rapid burst of slot image updates soon after a key press strongly
@@ -499,8 +522,30 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
             log::info!("Setting image for button {}", position);
 
             // OpenDeck sends image as a data url, so parse it using a library
-            let url = DataUrl::process(image.as_str()).unwrap(); // Isn't expected to fail, so unwrap it is
-            let (body, _fragment) = url.decode_to_vec().unwrap(); // Same here
+            let url = match DataUrl::process(image.as_str()) {
+                Ok(url) => url,
+                Err(err) => {
+                    log::error!(
+                        "Received malformed data URL for device {}, button {}: {}",
+                        device_id,
+                        position,
+                        err
+                    );
+                    return Err(MirajazzError::BadData);
+                }
+            };
+            let (body, _fragment) = match url.decode_to_vec() {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    log::error!(
+                        "Failed to decode data URL for device {}, button {}: {}",
+                        device_id,
+                        position,
+                        err
+                    );
+                    return Err(MirajazzError::BadData);
+                }
+            };
 
             // Allow only image/jpeg mime for now
             if url.mime_type().subtype != "jpeg" {
@@ -511,7 +556,16 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
 
             let image = load_from_memory_with_format(body.as_slice(), image::ImageFormat::Jpeg)?;
 
-            let kind = Kind::from_vid_pid(device.vid, device.pid).unwrap(); // Safe to unwrap here, because device is already filtered
+            let kind = Kind::from_vid_pid(device.vid, device.pid).ok_or_else(|| {
+                log::error!(
+                    "Unable to resolve device kind while setting image: vid={:#06x}, pid={:#06x}, device_id={}, button={}",
+                    device.vid,
+                    device.pid,
+                    device_id,
+                    position
+                );
+                MirajazzError::BadData
+            })?;
             let format = get_image_format_for_key(&kind, position);
             let image = normalize_button_image(image, format.size.0 as u32, format.size.1 as u32);
 
