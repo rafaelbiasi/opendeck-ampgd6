@@ -217,10 +217,10 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
 
     log::info!("Reader is ready for {}", candidate.id);
 
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
-    let mut pressed_buttons: HashSet<u8> = HashSet::new();
-    let mut last_repeat = std::time::Instant::now();
+    // Track when each button should fire its next repeat event
+    let mut pressed_buttons: HashMap<u8, std::time::Instant> = HashMap::new();
 
     loop {
         log::debug!("Reading updates...");
@@ -228,11 +228,15 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
         let current_timeout = if pressed_buttons.is_empty() {
             None
         } else {
-            let elapsed = last_repeat.elapsed();
-            if elapsed >= Duration::from_millis(200) {
-                Some(Duration::from_millis(1))
+            let now = std::time::Instant::now();
+            if let Some(&next_time) = pressed_buttons.values().min() {
+                if now >= next_time {
+                    Some(Duration::from_millis(1))
+                } else {
+                    Some(next_time.duration_since(now))
+                }
             } else {
-                Some(Duration::from_millis(200) - elapsed)
+                None
             }
         };
 
@@ -252,10 +256,8 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
 
             match &update {
                 DeviceStateUpdate::ButtonDown(key) => {
-                    if pressed_buttons.insert(*key) {
-                        // Reset the repeat timer when a new key is physically pressed
-                        last_repeat = std::time::Instant::now();
-                    }
+                    // Initial wait time of 500ms before repeating
+                    pressed_buttons.insert(*key, std::time::Instant::now() + Duration::from_millis(500));
                 }
                 DeviceStateUpdate::ButtonUp(key) => {
                     pressed_buttons.remove(key);
@@ -310,11 +312,21 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
             }
         }
 
-        if !pressed_buttons.is_empty() && last_repeat.elapsed() >= Duration::from_millis(200) {
-            last_repeat = std::time::Instant::now();
+        let now = std::time::Instant::now();
+        let mut to_repeat = Vec::new();
+
+        for (&key, next_time) in pressed_buttons.iter_mut() {
+            if now >= *next_time {
+                to_repeat.push(key);
+                // After the first 500ms delay, subsequent repeats happen every 200ms
+                *next_time = now + Duration::from_millis(200);
+            }
+        }
+
+        if !to_repeat.is_empty() {
             let id = candidate.id.clone();
             if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
-                for &key in &pressed_buttons {
+                for key in to_repeat {
                     log::trace!("Sending repeat key_down event: device_id={}, key={}", id, key);
                     if let Err(err) = outbound.key_down(id.clone(), key).await {
                         log::warn!(
