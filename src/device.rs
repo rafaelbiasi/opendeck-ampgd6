@@ -238,7 +238,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
                 if !handle_error(&candidate.id, e).await {
                     break;
                 }
-
+                tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
         };
@@ -363,6 +363,10 @@ async fn debounced_flush_worker(
         }
 
         tokio::time::sleep(IMAGE_FLUSH_DEBOUNCE).await;
+
+        if image_state.shutdown_token.is_cancelled() {
+            return;
+        }
 
         while flush_rx.try_recv().is_ok() {}
 
