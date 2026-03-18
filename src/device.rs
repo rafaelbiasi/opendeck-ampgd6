@@ -229,10 +229,10 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
             None
         } else {
             let elapsed = last_repeat.elapsed();
-            if elapsed >= Duration::from_millis(250) {
+            if elapsed >= Duration::from_millis(200) {
                 Some(Duration::from_millis(1))
             } else {
-                Some(Duration::from_millis(250) - elapsed)
+                Some(Duration::from_millis(200) - elapsed)
             }
         };
 
@@ -252,7 +252,10 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
 
             match &update {
                 DeviceStateUpdate::ButtonDown(key) => {
-                    pressed_buttons.insert(*key);
+                    if pressed_buttons.insert(*key) {
+                        // Reset the repeat timer when a new key is physically pressed
+                        last_repeat = std::time::Instant::now();
+                    }
                 }
                 DeviceStateUpdate::ButtonUp(key) => {
                     pressed_buttons.remove(key);
@@ -307,7 +310,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
             }
         }
 
-        if !pressed_buttons.is_empty() && last_repeat.elapsed() >= Duration::from_millis(250) {
+        if !pressed_buttons.is_empty() && last_repeat.elapsed() >= Duration::from_millis(200) {
             last_repeat = std::time::Instant::now();
             let id = candidate.id.clone();
             if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
