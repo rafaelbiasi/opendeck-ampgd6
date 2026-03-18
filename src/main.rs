@@ -81,10 +81,9 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {
         let device = DEVICES.read().await.get(&event.device).cloned();
 
         if let Some(device) = device {
-            handle_set_image(device.as_ref(), event)
-                .await
-                .map_err(async |err| handle_error(&id, err).await)
-                .ok();
+            if let Err(err) = handle_set_image(device.as_ref(), event).await {
+                handle_error(&id, err).await;
+            }
         } else {
             log::error!("Received event for unknown device: {}", event.device);
         }
@@ -104,11 +103,9 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {
         let device = DEVICES.read().await.get(&event.device).cloned();
 
         if let Some(device) = device {
-            device
-                .set_brightness(event.brightness)
-                .await
-                .map_err(async |err| handle_error(&id, err).await)
-                .ok();
+            if let Err(err) = device.set_brightness(event.brightness).await {
+                handle_error(&id, err).await;
+            }
         } else {
             log::error!("Received event for unknown device: {}", event.device);
         }
