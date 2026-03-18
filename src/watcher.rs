@@ -16,15 +16,15 @@ use crate::{
 fn get_device_id(dev: &HidDeviceInfo) -> Option<String> {
     let kind = Kind::from_vid_pid(dev.vendor_id, dev.product_id)?;
 
-    match kind.protocol_version() {
+    match kind.write_protocol_version() {
         2 | 3 => Some(format!(
             "{}-{}",
             DEVICE_NAMESPACE,
             dev.serial_number.clone()?,
         )),
         1 => {
-            // All the "v1" devices share the same serial. Hardcode it because Windows returns invalid serial for them
-            // Also suffix v1 devices with the
+            // All "v1" devices share the same serial. Keep a stable synthetic ID so
+            // OpenDeck sees the same device identity across reconnects and restarts.
             Some(format!(
                 "{}-355499441494-{}",
                 DEVICE_NAMESPACE,

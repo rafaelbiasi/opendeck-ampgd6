@@ -12,6 +12,11 @@ Requires OpenDeck 2.5.0 or newer
 
 - FIFINE Ampligame D6 (3142:0007)
 
+## Known issues
+
+- The D6 currently behaves like a protocol v1 device for identity purposes, so using two identical D6 units at the same time is not supported.
+- If you used a pre-`0.2.0` build of this plugin, OpenDeck may not reuse old page bindings automatically because the device namespace changed from `99` to `d6`.
+
 ## Platform support
 
 - Linux: Guaranteed, if stuff breaks - I'll probably catch it before public release

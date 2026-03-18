@@ -26,6 +26,7 @@ pub struct DeviceImageState {
     pub state_mutex: Mutex<DeviceImageStateInner>,
     pub io_mutex: Mutex<()>,
     pub flush_tx: mpsc::Sender<()>,
+    pub shutdown_token: CancellationToken,
 }
 
 pub struct DeviceImageStateInner {

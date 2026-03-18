@@ -25,21 +25,6 @@ pub const AMPGD6_QUERY: DeviceQuery = DeviceQuery::new(65440, 1, FIFINE_VID, AMP
 
 pub const QUERIES: [DeviceQuery; 1] = [AMPGD6_QUERY];
 
-/// Returns correct image format for device kind and key
-pub fn get_image_format_for_key(kind: &Kind, _key: u8) -> ImageFormat {
-    // Larger frames get cropped by the device firmware.
-    // Keep the conservative size and let the renderer center the source image.
-    let _ = kind;
-    let size = (100, 100);
-
-    ImageFormat {
-        mode: ImageMode::JPEG,
-        size,
-        rotation: ImageRotation::Rot180, // AMPGD6 needs 180° rotation
-        mirror: ImageMirroring::None,    // No mirroring needed for AMPGD6
-    }
-}
-
 impl Kind {
     /// Matches devices VID+PID pairs to correct kinds
     pub fn from_vid_pid(vid: u16, pid: u16) -> Option<Self> {
@@ -52,10 +37,17 @@ impl Kind {
         }
     }
 
-    /// Returns protocol version for device
-    pub fn protocol_version(&self) -> usize {
+    /// Returns protocol version used for writes and initialization.
+    pub fn write_protocol_version(&self) -> usize {
         match self {
-            Self::AMPGD6 => 1, // Back to version 1 - the error might be related to button count or initialization
+            Self::AMPGD6 => 1,
+        }
+    }
+
+    /// Returns the protocol version expected by the D6 input reports.
+    pub fn read_protocol_version(&self) -> usize {
+        match self {
+            Self::AMPGD6 => 3,
         }
     }
 
@@ -67,6 +59,37 @@ impl Kind {
         }
     }
 
+    pub fn image_format(&self, _key: u8) -> ImageFormat {
+        // Larger frames get cropped by the device firmware.
+        // Keep the conservative size and let the renderer center the source image.
+        let size = (100, 100);
+
+        ImageFormat {
+            mode: ImageMode::JPEG,
+            size,
+            rotation: ImageRotation::Rot180,
+            mirror: ImageMirroring::None,
+        }
+    }
+
+    pub fn supports_brightness(&self) -> bool {
+        match self {
+            Self::AMPGD6 => true,
+        }
+    }
+
+    pub fn supports_keepalive(&self) -> bool {
+        match self {
+            Self::AMPGD6 => false,
+        }
+    }
+
+    pub fn known_singleton_limit(&self) -> bool {
+        match self {
+            Self::AMPGD6 => true,
+        }
+    }
+
     /// Because "v1" devices all share the same serial number, use custom suffix to be able to connect
     /// two devices with the different revisions at the same time
     pub fn id_suffix(&self) -> &'static str {
@@ -74,6 +97,11 @@ impl Kind {
             Self::AMPGD6 => "AMPGD6",
         }
     }
+}
+
+/// Returns correct image format for device kind and key
+pub fn get_image_format_for_key(kind: &Kind, key: u8) -> ImageFormat {
+    kind.image_format(key)
 }
 
 #[derive(Debug, Clone)]
