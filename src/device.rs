@@ -4,7 +4,8 @@ use image::{
     load_from_memory_with_format,
 };
 use mirajazz::{
-    device::Device, error::MirajazzError, state::DeviceStateUpdate, types::ImageFormat,
+    device::Device, error::MirajazzError, images::convert_image_with_format,
+    state::DeviceStateUpdate, types::ImageFormat,
 };
 use openaction::{OUTBOUND_EVENT_MANAGER, SetImageEvent};
 use std::{
@@ -31,6 +32,7 @@ use crate::{
 
 const IMAGE_CACHE_LIMIT: usize = 64;
 const CLEAR_ALL_BATCH_WINDOW: Duration = Duration::from_millis(12);
+const IMAGE_BATCH_WINDOW: Duration = Duration::from_millis(4);
 
 static DEVICE_RENDERERS: LazyLock<Mutex<HashMap<String, Arc<DeviceRenderHandle>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -60,6 +62,16 @@ struct DeviceRenderHandle {
 }
 
 type RenderBatch = [Option<BatchedRenderOp>; KEY_COUNT];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ConvertedImageCacheKey {
+    image_hash: u64,
+    width: usize,
+    height: usize,
+    mode: u8,
+    rotation: u8,
+    mirror: u8,
+}
 
 /// Initializes a device and listens for events
 pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
@@ -364,14 +376,13 @@ fn blank_button_image(width: u32, height: u32) -> DynamicImage {
     DynamicImage::ImageRgb8(blank)
 }
 
-async fn clear_button_with_black_frame(
+async fn queue_button_image_data(
     device: &Device,
     position: u8,
-    format: ImageFormat,
-    image: Arc<DynamicImage>,
+    image_data: &[u8],
 ) -> Result<(), MirajazzError> {
     device
-        .set_button_image(opendeck_to_device(position), format, (*image).clone())
+        .write_image(opendeck_to_device(position), image_data)
         .await
 }
 
@@ -391,6 +402,43 @@ fn hash_image_payload(image: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     image.hash(&mut hasher);
     hasher.finish()
+}
+
+fn image_mode_code(format: ImageFormat) -> u8 {
+    match format.mode {
+        mirajazz::types::ImageMode::None => 0,
+        mirajazz::types::ImageMode::BMP => 1,
+        mirajazz::types::ImageMode::JPEG => 2,
+    }
+}
+
+fn image_rotation_code(format: ImageFormat) -> u8 {
+    match format.rotation {
+        mirajazz::types::ImageRotation::Rot0 => 0,
+        mirajazz::types::ImageRotation::Rot90 => 1,
+        mirajazz::types::ImageRotation::Rot180 => 2,
+        mirajazz::types::ImageRotation::Rot270 => 3,
+    }
+}
+
+fn image_mirror_code(format: ImageFormat) -> u8 {
+    match format.mirror {
+        mirajazz::types::ImageMirroring::None => 0,
+        mirajazz::types::ImageMirroring::X => 1,
+        mirajazz::types::ImageMirroring::Y => 2,
+        mirajazz::types::ImageMirroring::Both => 3,
+    }
+}
+
+fn converted_image_cache_key(image_hash: u64, format: ImageFormat) -> ConvertedImageCacheKey {
+    ConvertedImageCacheKey {
+        image_hash,
+        width: format.size.0,
+        height: format.size.1,
+        mode: image_mode_code(format),
+        rotation: image_rotation_code(format),
+        mirror: image_mirror_code(format),
+    }
 }
 
 fn validate_button_position(position: u8) -> Result<usize, MirajazzError> {
@@ -485,8 +533,12 @@ fn empty_render_batch() -> RenderBatch {
     array::from_fn(|_| None)
 }
 
-fn should_wait_for_follow_up_batch(command: &RenderCommand) -> bool {
-    matches!(command, RenderCommand::ClearAll)
+fn follow_up_batch_window(command: &RenderCommand) -> Option<Duration> {
+    match command {
+        RenderCommand::ClearAll => Some(CLEAR_ALL_BATCH_WINDOW),
+        RenderCommand::SetImage { .. } => Some(IMAGE_BATCH_WINDOW),
+        RenderCommand::ClearButton { .. } => None,
+    }
 }
 
 fn batch_contains_image_updates(batch: &RenderBatch) -> bool {
@@ -525,53 +577,69 @@ fn apply_render_command_to_batch(
     Ok(())
 }
 
-async fn get_or_decode_cached_image(
-    normalized_image_cache: &mut HashMap<u64, Arc<DynamicImage>>,
+async fn get_or_convert_cached_image(
+    converted_image_cache: &mut HashMap<ConvertedImageCacheKey, Arc<Vec<u8>>>,
     device_id: &str,
     position: u8,
     format: ImageFormat,
     image_hash: u64,
     payload: String,
-) -> Result<Arc<DynamicImage>, MirajazzError> {
-    if let Some(image) = normalized_image_cache.get(&image_hash) {
-        return Ok(image.clone());
+) -> Result<Arc<Vec<u8>>, MirajazzError> {
+    let cache_key = converted_image_cache_key(image_hash, format);
+
+    if let Some(image_data) = converted_image_cache.get(&cache_key) {
+        log::debug!(
+            "Converted image cache hit: device_id={}, button={}, image_hash={}",
+            device_id,
+            position,
+            image_hash
+        );
+        return Ok(image_data.clone());
     }
 
-    let decoded = Arc::new(decode_button_image_async(device_id, position, format, payload).await?);
+    log::debug!(
+        "Converted image cache miss: device_id={}, button={}, image_hash={}",
+        device_id,
+        position,
+        image_hash
+    );
 
-    if normalized_image_cache.len() >= IMAGE_CACHE_LIMIT
-        && !normalized_image_cache.contains_key(&image_hash)
+    let decoded = decode_button_image_async(device_id, position, format, payload).await?;
+    let converted = Arc::new(convert_image_with_format(format, decoded).await?);
+
+    if converted_image_cache.len() >= IMAGE_CACHE_LIMIT
+        && !converted_image_cache.contains_key(&cache_key)
     {
-        normalized_image_cache.clear();
+        converted_image_cache.clear();
     }
 
-    normalized_image_cache.insert(image_hash, decoded.clone());
+    converted_image_cache.insert(cache_key, converted.clone());
 
-    Ok(decoded)
+    Ok(converted)
 }
 
-fn build_render_assets(kind: &Kind) -> (Vec<ImageFormat>, Vec<Arc<DynamicImage>>) {
+async fn build_render_assets(
+    kind: &Kind,
+) -> Result<(Vec<ImageFormat>, Vec<Arc<Vec<u8>>>), MirajazzError> {
     let button_formats = (0..KEY_COUNT)
         .map(|position| get_image_format_for_key(kind, position as u8))
         .collect::<Vec<_>>();
-    let black_frames = button_formats
-        .iter()
-        .map(|format| {
-            Arc::new(blank_button_image(
-                format.size.0 as u32,
-                format.size.1 as u32,
-            ))
-        })
-        .collect::<Vec<_>>();
+    let mut black_frames = Vec::with_capacity(button_formats.len());
 
-    (button_formats, black_frames)
+    for format in &button_formats {
+        let black_frame = blank_button_image(format.size.0 as u32, format.size.1 as u32);
+        black_frames.push(Arc::new(
+            convert_image_with_format(*format, black_frame).await?,
+        ));
+    }
+
+    Ok((button_formats, black_frames))
 }
 
 async fn clear_all_button_images_with_assets(
     device: &Device,
     device_id: &str,
-    button_formats: &[ImageFormat],
-    black_frames: &[Arc<DynamicImage>],
+    black_frames: &[Arc<Vec<u8>>],
 ) -> Result<(), MirajazzError> {
     if let Err(err) = device.clear_all_button_images().await {
         log::warn!(
@@ -582,13 +650,7 @@ async fn clear_all_button_images_with_assets(
 
         for position in 0..KEY_COUNT as u8 {
             let index = position as usize;
-            clear_button_with_black_frame(
-                device,
-                position,
-                button_formats[index].clone(),
-                black_frames[index].clone(),
-            )
-            .await?;
+            queue_button_image_data(device, position, black_frames[index].as_slice()).await?;
         }
     }
 
@@ -600,8 +662,8 @@ async fn clear_all_button_images_for_kind(
     device_id: &str,
     kind: &Kind,
 ) -> Result<(), MirajazzError> {
-    let (button_formats, black_frames) = build_render_assets(kind);
-    clear_all_button_images_with_assets(device, device_id, &button_formats, &black_frames).await
+    let (_, black_frames) = build_render_assets(kind).await?;
+    clear_all_button_images_with_assets(device, device_id, &black_frames).await
 }
 
 async fn remove_renderer_handle(device_id: &str, handle: &Arc<DeviceRenderHandle>) {
@@ -672,13 +734,14 @@ async fn process_render_batch(
     device: &Device,
     device_id: &str,
     button_formats: &[ImageFormat],
-    black_frames: &[Arc<DynamicImage>],
-    normalized_image_cache: &mut HashMap<u64, Arc<DynamicImage>>,
+    black_frames: &[Arc<Vec<u8>>],
+    converted_image_cache: &mut HashMap<ConvertedImageCacheKey, Arc<Vec<u8>>>,
     last_image_hashes: &mut [Option<u64>; KEY_COUNT],
     clear_all: bool,
     batch: RenderBatch,
 ) -> Result<(), MirajazzError> {
-    let mut wrote_to_device = false;
+    let mut writes_to_device = 0usize;
+    let queued_ops = batch.iter().filter(|op| op.is_some()).count();
 
     if clear_all {
         if batch_contains_image_updates(&batch) {
@@ -687,21 +750,15 @@ async fn process_render_batch(
                     continue;
                 }
 
-                clear_button_with_black_frame(
-                    device,
-                    index as u8,
-                    button_formats[index].clone(),
-                    black_frames[index].clone(),
-                )
-                .await?;
+                queue_button_image_data(device, index as u8, black_frames[index].as_slice())
+                    .await?;
                 last_image_hashes[index] = None;
-                wrote_to_device = true;
+                writes_to_device += 1;
             }
         } else {
-            clear_all_button_images_with_assets(device, device_id, button_formats, black_frames)
-                .await?;
+            clear_all_button_images_with_assets(device, device_id, black_frames).await?;
             last_image_hashes.fill(None);
-            wrote_to_device = true;
+            writes_to_device += 1;
         }
     }
 
@@ -712,15 +769,10 @@ async fn process_render_batch(
                     continue;
                 }
 
-                clear_button_with_black_frame(
-                    device,
-                    index as u8,
-                    button_formats[index].clone(),
-                    black_frames[index].clone(),
-                )
-                .await?;
+                queue_button_image_data(device, index as u8, black_frames[index].as_slice())
+                    .await?;
                 last_image_hashes[index] = None;
-                wrote_to_device = true;
+                writes_to_device += 1;
             }
             Some(BatchedRenderOp::Image {
                 image_hash,
@@ -730,12 +782,12 @@ async fn process_render_batch(
                     continue;
                 }
 
-                let format = button_formats[index].clone();
-                let image = match get_or_decode_cached_image(
-                    normalized_image_cache,
+                let format = button_formats[index];
+                let image_data = match get_or_convert_cached_image(
+                    converted_image_cache,
                     device_id,
                     index as u8,
-                    format.clone(),
+                    format,
                     image_hash,
                     payload,
                 )
@@ -746,18 +798,24 @@ async fn process_render_batch(
                     Err(err) => return Err(err),
                 };
 
-                device
-                    .set_button_image(opendeck_to_device(index as u8), format, (*image).clone())
-                    .await?;
+                queue_button_image_data(device, index as u8, image_data.as_slice()).await?;
 
                 last_image_hashes[index] = Some(image_hash);
-                wrote_to_device = true;
+                writes_to_device += 1;
             }
             None => {}
         }
     }
 
-    if wrote_to_device {
+    log::debug!(
+        "Processed render batch: device_id={}, clear_all={}, queued_ops={}, writes={}",
+        device_id,
+        clear_all,
+        queued_ops,
+        writes_to_device
+    );
+
+    if writes_to_device > 0 {
         device.flush().await?;
     }
 
@@ -770,8 +828,15 @@ async fn render_worker(
     handle: Arc<DeviceRenderHandle>,
     mut command_rx: mpsc::UnboundedReceiver<RenderCommand>,
 ) {
-    let (button_formats, black_frames) = build_render_assets(&kind);
-    let mut normalized_image_cache = HashMap::new();
+    let (button_formats, black_frames) = match build_render_assets(&kind).await {
+        Ok(assets) => assets,
+        Err(err) => {
+            handle_error(&device_id, err).await;
+            remove_renderer_handle(&device_id, &handle).await;
+            return;
+        }
+    };
+    let mut converted_image_cache = HashMap::new();
     let mut last_image_hashes = [None; KEY_COUNT];
 
     loop {
@@ -787,11 +852,12 @@ async fn render_worker(
         let mut batch = empty_render_batch();
         let mut clear_all = false;
 
-        if should_wait_for_follow_up_batch(&command) {
-            // Page switches often send a clear followed immediately by a burst of new images.
-            // A short wait lets us coalesce that burst into a single device flush.
+        if let Some(window) = follow_up_batch_window(&command) {
+            // Page switches may arrive either as `ClearAll + SetImage...` or as a burst of
+            // `SetImage` updates only. A short idle window lets us collapse both patterns into
+            // a single flush.
             tokio::select! {
-                _ = tokio::time::sleep(CLEAR_ALL_BATCH_WINDOW) => {},
+                _ = tokio::time::sleep(window) => {},
                 _ = handle.shutdown_token.cancelled() => break,
             }
         }
@@ -816,12 +882,20 @@ async fn render_worker(
             break;
         };
 
+        log::debug!(
+            "Rendering batch: device_id={}, clear_all={}, ops={}, image_updates={}",
+            device_id,
+            clear_all,
+            batch.iter().filter(|op| op.is_some()).count(),
+            batch_contains_image_updates(&batch)
+        );
+
         if let Err(err) = process_render_batch(
             device.as_ref(),
             &device_id,
             &button_formats,
             &black_frames,
-            &mut normalized_image_cache,
+            &mut converted_image_cache,
             &mut last_image_hashes,
             clear_all,
             batch,
@@ -871,10 +945,17 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use mirajazz::types::{ImageMirroring, ImageMode, ImageRotation};
+
+    use crate::mappings::{KEY_COUNT, Kind};
+
     use super::{
-        BatchedRenderOp, RenderCommand, apply_render_command_to_batch,
-        batch_contains_image_updates, empty_render_batch, should_apply_clear, should_apply_image,
-        should_wait_for_follow_up_batch,
+        BatchedRenderOp, CLEAR_ALL_BATCH_WINDOW, IMAGE_BATCH_WINDOW, RenderCommand,
+        apply_render_command_to_batch, batch_contains_image_updates, build_render_assets,
+        converted_image_cache_key, empty_render_batch, follow_up_batch_window, should_apply_clear,
+        should_apply_image,
     };
 
     #[test]
@@ -973,16 +1054,60 @@ mod tests {
 
     #[test]
     fn clear_all_waits_for_follow_up_batch() {
-        assert!(should_wait_for_follow_up_batch(&RenderCommand::ClearAll));
+        assert_eq!(
+            follow_up_batch_window(&RenderCommand::ClearAll),
+            Some(CLEAR_ALL_BATCH_WINDOW)
+        );
     }
 
     #[test]
-    fn regular_image_update_does_not_wait_for_follow_up_batch() {
-        assert!(!should_wait_for_follow_up_batch(&RenderCommand::SetImage {
-            position: 0,
-            image_hash: 1,
-            payload: "a".to_string(),
-        }));
+    fn regular_image_update_waits_for_follow_up_batch() {
+        assert_eq!(
+            follow_up_batch_window(&RenderCommand::SetImage {
+                position: 0,
+                image_hash: 1,
+                payload: "a".to_string(),
+            }),
+            Some(IMAGE_BATCH_WINDOW)
+        );
+    }
+
+    #[test]
+    fn clear_button_does_not_wait_for_follow_up_batch() {
+        assert_eq!(
+            follow_up_batch_window(&RenderCommand::ClearButton { position: 0 }),
+            Option::<Duration>::None
+        );
+    }
+
+    #[test]
+    fn converted_image_cache_key_includes_format() {
+        let jpeg = mirajazz::types::ImageFormat {
+            mode: ImageMode::JPEG,
+            size: (100, 100),
+            rotation: ImageRotation::Rot180,
+            mirror: ImageMirroring::None,
+        };
+        let bmp = mirajazz::types::ImageFormat {
+            mode: ImageMode::BMP,
+            size: (100, 100),
+            rotation: ImageRotation::Rot180,
+            mirror: ImageMirroring::None,
+        };
+
+        assert_ne!(
+            converted_image_cache_key(7, jpeg),
+            converted_image_cache_key(7, bmp)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_render_assets_preconverts_black_frames() {
+        let (formats, black_frames) = build_render_assets(&Kind::AMPGD6).await.unwrap();
+
+        assert_eq!(formats.len(), KEY_COUNT);
+        assert_eq!(black_frames.len(), KEY_COUNT);
+        assert!(black_frames.iter().all(|payload| !payload.is_empty()));
     }
 
     #[test]
