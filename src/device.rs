@@ -3,18 +3,25 @@ use image::{
     DynamicImage, GenericImage, ImageBuffer, Rgb, RgbImage, imageops::FilterType,
     load_from_memory_with_format,
 };
-use mirajazz::{device::Device, error::MirajazzError, state::DeviceStateUpdate};
+use mirajazz::{
+    device::Device, error::MirajazzError, state::DeviceStateUpdate, types::ImageFormat,
+};
 use openaction::{OUTBOUND_EVENT_MANAGER, SetImageEvent};
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
+use std::{
+    array,
+    collections::{HashMap, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::spawn_blocking,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    DEVICE_IMAGE_STATES, DEVICES, DeviceImageState, PendingButtonOp, TOKENS, TRACKER,
+    DEVICES, TOKENS, TRACKER,
     inputs::{apply_input_event, decode_input_report, ignore_process_input, opendeck_to_device},
     mappings::{
         COL_COUNT, CandidateDevice, ENCODER_COUNT, KEY_COUNT, Kind, ROW_COUNT,
@@ -22,8 +29,36 @@ use crate::{
     },
 };
 
-const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(5);
 const IMAGE_CACHE_LIMIT: usize = 64;
+
+static DEVICE_RENDERERS: LazyLock<Mutex<HashMap<String, Arc<DeviceRenderHandle>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RenderCommand {
+    SetImage {
+        position: u8,
+        image_hash: u64,
+        payload: String,
+    },
+    ClearButton {
+        position: u8,
+    },
+    ClearAll,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BatchedRenderOp {
+    Clear,
+    Image { image_hash: u64, payload: String },
+}
+
+struct DeviceRenderHandle {
+    command_tx: mpsc::UnboundedSender<RenderCommand>,
+    shutdown_token: CancellationToken,
+}
+
+type RenderBatch = [Option<BatchedRenderOp>; KEY_COUNT];
 
 /// Initializes a device and listens for events
 pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
@@ -38,7 +73,6 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
         log::debug!("Keepalive is disabled for {}", candidate.id);
     }
 
-    // Wrap in a closure so we can use `?` operator
     let device = async {
         log::info!("Connecting to device...");
         let device = connect(&candidate).await?;
@@ -56,43 +90,25 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
             }
         }
 
-        // Use the native clear once during init to wipe the factory splash/framebuffer.
-        // If it fails, fall back to overwriting every key with a black frame.
         log::info!("Clearing all button images...");
-        if let Err(e) = device.clear_all_button_images().await {
+        if let Err(e) =
+            clear_all_button_images_for_kind(&device, &candidate.id, &candidate.kind).await
+        {
             log::warn!(
-                "Failed to clear all button images with native command, falling back to per-key black frames: {}",
+                "Failed to clear all button images during init for device {}: {}",
+                candidate.id,
                 e
             );
-            let kind = resolve_device_kind(&device, &candidate.id)?;
-
-            for position in 0..KEY_COUNT as u8 {
-                let format = get_image_format_for_key(&kind, position);
-                let black_frame =
-                    Arc::new(blank_button_image(format.size.0 as u32, format.size.1 as u32));
-                if let Err(e) =
-                    clear_button_with_black_frame(&device, position, format, black_frame).await
-                {
-                    log::warn!(
-                        "Failed to clear button {} during init fallback (this may be normal for this device): {}",
-                        position,
-                        e
-                    );
-                    break;
-                }
-            }
         } else {
             log::info!("Button images cleared successfully");
         }
 
-        // Try to flush - some devices may not need this
         log::info!("Flushing device...");
         if let Err(e) = device.flush().await {
             log::warn!(
                 "Failed to flush device (this may be normal for this device): {}",
                 e
             );
-            // Continue anyway
         } else {
             log::info!("Device flushed successfully");
         }
@@ -166,7 +182,6 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
 pub async fn handle_error(id: &String, err: MirajazzError) -> bool {
     log::error!("Device {} error: {}", id, err);
 
-    // Some errors are not critical and can be ignored without sending disconnected event
     if matches!(err, MirajazzError::ImageError(_) | MirajazzError::BadData) {
         return true;
     }
@@ -193,8 +208,9 @@ pub async fn cleanup_device_state(id: &str) {
 
     log::info!("Removing device {} from the list", id);
     DEVICES.write().await.remove(id);
-    if let Some(image_state) = DEVICE_IMAGE_STATES.lock().await.remove(id) {
-        image_state.shutdown_token.cancel();
+
+    if let Some(renderer) = DEVICE_RENDERERS.lock().await.remove(id) {
+        renderer.shutdown_token.cancel();
     }
 }
 
@@ -211,7 +227,6 @@ pub async fn connect(candidate: &CandidateDevice) -> Result<Device, MirajazzErro
         Ok(device) => Ok(device),
         Err(e) => {
             log::error!("Error while connecting to device: {e}");
-
             Err(e)
         }
     }
@@ -226,6 +241,10 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
         Some(device) => device.get_reader(ignore_process_input),
         None => return Ok(()),
     };
+
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let tracker = TRACKER.lock().await.clone();
+    tracker.spawn(input_dispatch_worker(candidate.id.clone(), event_rx));
 
     log::info!("Connected to {} for incoming events", candidate.id);
     log::info!(
@@ -263,48 +282,8 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
         };
 
         for update in updates {
-            let id = candidate.id.clone();
-
-            if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
-                match update {
-                    DeviceStateUpdate::ButtonDown(key) => {
-                        log::debug!("Sending key_down event: device_id={}, key={}", id, key);
-                        if let Err(err) = outbound.key_down(id.clone(), key).await {
-                            log::warn!(
-                                "Failed to send key_down event: device_id={}, key={}, err={}",
-                                id,
-                                key,
-                                err
-                            );
-                        }
-                    }
-                    DeviceStateUpdate::ButtonUp(key) => {
-                        log::debug!("Sending key_up event: device_id={}, key={}", id, key);
-                        if let Err(err) = outbound.key_up(id.clone(), key).await {
-                            log::warn!(
-                                "Failed to send key_up event: device_id={}, key={}, err={}",
-                                id,
-                                key,
-                                err
-                            );
-                        }
-                    }
-                    DeviceStateUpdate::EncoderDown(encoder) => {
-                        if let Err(err) = outbound.encoder_down(id, encoder).await {
-                            log::warn!("Failed to send encoder_down event: {}", err);
-                        }
-                    }
-                    DeviceStateUpdate::EncoderUp(encoder) => {
-                        if let Err(err) = outbound.encoder_up(id, encoder).await {
-                            log::warn!("Failed to send encoder_up event: {}", err);
-                        }
-                    }
-                    DeviceStateUpdate::EncoderTwist(encoder, val) => {
-                        if let Err(err) = outbound.encoder_change(id, encoder, val as i16).await {
-                            log::warn!("Failed to send encoder_change event: {}", err);
-                        }
-                    }
-                }
+            if event_tx.send(update).is_err() {
+                return Ok(());
             }
         }
     }
@@ -312,9 +291,63 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     Ok(())
 }
 
+async fn input_dispatch_worker(
+    device_id: String,
+    mut event_rx: mpsc::UnboundedReceiver<DeviceStateUpdate>,
+) {
+    while let Some(update) = event_rx.recv().await {
+        if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
+            match update {
+                DeviceStateUpdate::ButtonDown(key) => {
+                    log::debug!(
+                        "Sending key_down event: device_id={}, key={}",
+                        device_id,
+                        key
+                    );
+                    if let Err(err) = outbound.key_down(device_id.clone(), key).await {
+                        log::warn!(
+                            "Failed to send key_down event: device_id={}, key={}, err={}",
+                            device_id,
+                            key,
+                            err
+                        );
+                    }
+                }
+                DeviceStateUpdate::ButtonUp(key) => {
+                    log::debug!("Sending key_up event: device_id={}, key={}", device_id, key);
+                    if let Err(err) = outbound.key_up(device_id.clone(), key).await {
+                        log::warn!(
+                            "Failed to send key_up event: device_id={}, key={}, err={}",
+                            device_id,
+                            key,
+                            err
+                        );
+                    }
+                }
+                DeviceStateUpdate::EncoderDown(encoder) => {
+                    if let Err(err) = outbound.encoder_down(device_id.clone(), encoder).await {
+                        log::warn!("Failed to send encoder_down event: {}", err);
+                    }
+                }
+                DeviceStateUpdate::EncoderUp(encoder) => {
+                    if let Err(err) = outbound.encoder_up(device_id.clone(), encoder).await {
+                        log::warn!("Failed to send encoder_up event: {}", err);
+                    }
+                }
+                DeviceStateUpdate::EncoderTwist(encoder, val) => {
+                    if let Err(err) = outbound
+                        .encoder_change(device_id.clone(), encoder, val as i16)
+                        .await
+                    {
+                        log::warn!("Failed to send encoder_change event: {}", err);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn normalize_button_image(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
-    // Keep the whole icon visible and center it on a black canvas.
-    // This avoids clipping icons that are slightly off-center in the source artwork.
     let resized = image.resize(width, height, FilterType::Triangle).to_rgb8();
     let mut canvas: RgbImage = ImageBuffer::from_pixel(width, height, Rgb([0, 0, 0]));
     let x = (width.saturating_sub(resized.width())) / 2;
@@ -333,53 +366,12 @@ fn blank_button_image(width: u32, height: u32) -> DynamicImage {
 async fn clear_button_with_black_frame(
     device: &Device,
     position: u8,
-    format: mirajazz::types::ImageFormat,
+    format: ImageFormat,
     image: Arc<DynamicImage>,
 ) -> Result<(), MirajazzError> {
     device
         .set_button_image(opendeck_to_device(position), format, (*image).clone())
         .await
-}
-
-async fn schedule_debounced_flush(device_id: &str, image_state: &Arc<DeviceImageState>) {
-    if image_state.flush_tx.try_send(()).is_err() {
-        log::debug!("Debounced flush already pending for device {}", device_id);
-    }
-}
-
-async fn debounced_flush_worker(
-    device_id: String,
-    image_state: Arc<DeviceImageState>,
-    mut flush_rx: mpsc::Receiver<()>,
-) {
-    loop {
-        let recv = tokio::select! {
-            recv = flush_rx.recv() => recv,
-            _ = image_state.shutdown_token.cancelled() => return,
-        };
-
-        if recv.is_none() {
-            return;
-        }
-
-        tokio::time::sleep(IMAGE_FLUSH_DEBOUNCE).await;
-
-        if image_state.shutdown_token.is_cancelled() {
-            return;
-        }
-
-        while flush_rx.try_recv().is_ok() {}
-
-        let Some(device) = DEVICES.read().await.get(&device_id).cloned() else {
-            return;
-        };
-        let _io_guard = image_state.io_mutex.lock().await;
-        let flush_result = device.flush().await;
-
-        if let Err(err) = flush_result {
-            handle_error(&device_id, err).await;
-        }
-    }
 }
 
 fn resolve_device_kind(device: &Device, device_id: &str) -> Result<Kind, MirajazzError> {
@@ -394,56 +386,10 @@ fn resolve_device_kind(device: &Device, device_id: &str) -> Result<Kind, Mirajaz
     })
 }
 
-async fn get_device_image_state(
-    device: &Device,
-    device_id: &str,
-) -> Result<Arc<DeviceImageState>, MirajazzError> {
-    let (state, flush_rx) = {
-        let mut states = DEVICE_IMAGE_STATES.lock().await;
-        if let Some(state) = states.get(device_id) {
-            return Ok(state.clone());
-        }
-
-        let kind = resolve_device_kind(device, device_id)?;
-        let button_formats = (0..KEY_COUNT)
-            .map(|position| get_image_format_for_key(&kind, position as u8))
-            .collect::<Vec<_>>();
-        let black_frames = button_formats
-            .iter()
-            .map(|format| Arc::new(blank_button_image(format.size.0 as u32, format.size.1 as u32)))
-            .collect::<Vec<_>>();
-        let (flush_tx, flush_rx) = mpsc::channel(1);
-        let state = Arc::new(DeviceImageState {
-            state_mutex: tokio::sync::Mutex::new(Default::default()),
-            io_mutex: tokio::sync::Mutex::new(()),
-            button_formats,
-            black_frames,
-            normalized_image_cache: tokio::sync::Mutex::new(HashMap::new()),
-            flush_tx,
-            shutdown_token: CancellationToken::new(),
-        });
-
-        states.insert(device_id.to_string(), state.clone());
-
-        (state, flush_rx)
-    };
-
-    let tracker = TRACKER.lock().await.clone();
-    tracker.spawn(debounced_flush_worker(
-        device_id.to_string(),
-        state.clone(),
-        flush_rx,
-    ));
-
-    Ok(state)
-}
-
-fn hash_image_payload(image: Option<&str>) -> Option<u64> {
-    image.map(|payload| {
-        let mut hasher = DefaultHasher::new();
-        payload.hash(&mut hasher);
-        hasher.finish()
-    })
+fn hash_image_payload(image: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    image.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn validate_button_position(position: u8) -> Result<usize, MirajazzError> {
@@ -463,7 +409,7 @@ fn validate_button_position(position: u8) -> Result<usize, MirajazzError> {
 fn decode_button_image(
     device_id: &str,
     position: u8,
-    format: mirajazz::types::ImageFormat,
+    format: ImageFormat,
     image: &str,
 ) -> Result<DynamicImage, MirajazzError> {
     let url = match DataUrl::process(image) {
@@ -504,195 +450,380 @@ fn decode_button_image(
     ))
 }
 
-async fn clear_pending_op(
-    image_state: &Arc<DeviceImageState>,
-    index: usize,
-    pending_op: Option<PendingButtonOp>,
-) {
-    let mut image_state = image_state.state_mutex.lock().await;
-    if image_state.pending_ops[index] == pending_op {
-        image_state.pending_ops[index] = None;
+async fn decode_button_image_async(
+    device_id: &str,
+    position: u8,
+    format: ImageFormat,
+    payload: String,
+) -> Result<DynamicImage, MirajazzError> {
+    let worker_device_id = device_id.to_string();
+    let join_device_id = worker_device_id.clone();
+
+    spawn_blocking(move || decode_button_image(&worker_device_id, position, format, &payload))
+        .await
+        .map_err(|err| {
+            log::error!(
+                "Image decode task panicked for device {}, button {}: {}",
+                join_device_id,
+                position,
+                err
+            );
+            MirajazzError::BadData
+        })?
+}
+
+fn should_apply_image(last_image_hash: Option<u64>, image_hash: u64) -> bool {
+    last_image_hash != Some(image_hash)
+}
+
+fn should_apply_clear(last_image_hash: Option<u64>) -> bool {
+    last_image_hash.is_some()
+}
+
+fn empty_render_batch() -> RenderBatch {
+    array::from_fn(|_| None)
+}
+
+fn apply_render_command_to_batch(
+    batch: &mut RenderBatch,
+    clear_all: &mut bool,
+    command: RenderCommand,
+) -> Result<(), MirajazzError> {
+    match command {
+        RenderCommand::SetImage {
+            position,
+            image_hash,
+            payload,
+        } => {
+            let index = validate_button_position(position)?;
+            batch[index] = Some(BatchedRenderOp::Image {
+                image_hash,
+                payload,
+            });
+        }
+        RenderCommand::ClearButton { position } => {
+            let index = validate_button_position(position)?;
+            batch[index] = Some(BatchedRenderOp::Clear);
+        }
+        RenderCommand::ClearAll => {
+            *clear_all = true;
+            batch.fill(None);
+        }
+    }
+
+    Ok(())
+}
+
+async fn get_or_decode_cached_image(
+    normalized_image_cache: &mut HashMap<u64, Arc<DynamicImage>>,
+    device_id: &str,
+    position: u8,
+    format: ImageFormat,
+    image_hash: u64,
+    payload: String,
+) -> Result<Arc<DynamicImage>, MirajazzError> {
+    if let Some(image) = normalized_image_cache.get(&image_hash) {
+        return Ok(image.clone());
+    }
+
+    let decoded = Arc::new(decode_button_image_async(device_id, position, format, payload).await?);
+
+    if normalized_image_cache.len() >= IMAGE_CACHE_LIMIT
+        && !normalized_image_cache.contains_key(&image_hash)
+    {
+        normalized_image_cache.clear();
+    }
+
+    normalized_image_cache.insert(image_hash, decoded.clone());
+
+    Ok(decoded)
+}
+
+fn build_render_assets(kind: &Kind) -> (Vec<ImageFormat>, Vec<Arc<DynamicImage>>) {
+    let button_formats = (0..KEY_COUNT)
+        .map(|position| get_image_format_for_key(kind, position as u8))
+        .collect::<Vec<_>>();
+    let black_frames = button_formats
+        .iter()
+        .map(|format| {
+            Arc::new(blank_button_image(
+                format.size.0 as u32,
+                format.size.1 as u32,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    (button_formats, black_frames)
+}
+
+async fn clear_all_button_images_with_assets(
+    device: &Device,
+    device_id: &str,
+    button_formats: &[ImageFormat],
+    black_frames: &[Arc<DynamicImage>],
+) -> Result<(), MirajazzError> {
+    if let Err(err) = device.clear_all_button_images().await {
+        log::warn!(
+            "Failed to clear all button images natively for device {}, falling back to per-key black frames: {}",
+            device_id,
+            err
+        );
+
+        for position in 0..KEY_COUNT as u8 {
+            let index = position as usize;
+            clear_button_with_black_frame(
+                device,
+                position,
+                button_formats[index].clone(),
+                black_frames[index].clone(),
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn clear_all_button_images_for_kind(
+    device: &Device,
+    device_id: &str,
+    kind: &Kind,
+) -> Result<(), MirajazzError> {
+    let (button_formats, black_frames) = build_render_assets(kind);
+    clear_all_button_images_with_assets(device, device_id, &button_formats, &black_frames).await
+}
+
+async fn remove_renderer_handle(device_id: &str, handle: &Arc<DeviceRenderHandle>) {
+    let mut renderers = DEVICE_RENDERERS.lock().await;
+    if renderers
+        .get(device_id)
+        .is_some_and(|existing| Arc::ptr_eq(existing, handle))
+    {
+        renderers.remove(device_id);
     }
 }
 
-fn should_skip_image_update(
-    last_image_hash: Option<u64>,
-    pending_op: Option<PendingButtonOp>,
-    image_hash: u64,
-) -> bool {
-    last_image_hash == Some(image_hash) || pending_op == Some(PendingButtonOp::Image(image_hash))
-}
-
-fn should_skip_clear(last_image_hash: Option<u64>, pending_op: Option<PendingButtonOp>) -> bool {
-    last_image_hash.is_none() && pending_op.is_none_or(|op| op == PendingButtonOp::Clear)
-}
-
-async fn get_cached_image(
-    image_state: &Arc<DeviceImageState>,
-    image_hash: u64,
-) -> Option<Arc<DynamicImage>> {
-    let cache = image_state.normalized_image_cache.lock().await;
-    cache.get(&image_hash).cloned()
-}
-
-async fn insert_cached_image(
-    image_state: &Arc<DeviceImageState>,
-    image_hash: u64,
-    image: Arc<DynamicImage>,
-) {
-    let mut cache = image_state.normalized_image_cache.lock().await;
-    if cache.len() >= IMAGE_CACHE_LIMIT && !cache.contains_key(&image_hash) {
-        cache.clear();
+async fn get_device_renderer(
+    device: &Device,
+    device_id: &str,
+) -> Result<Arc<DeviceRenderHandle>, MirajazzError> {
+    {
+        let renderers = DEVICE_RENDERERS.lock().await;
+        if let Some(renderer) = renderers.get(device_id) {
+            return Ok(renderer.clone());
+        }
     }
-    cache.insert(image_hash, image);
+
+    let kind = resolve_device_kind(device, device_id)?;
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let handle = Arc::new(DeviceRenderHandle {
+        command_tx,
+        shutdown_token: CancellationToken::new(),
+    });
+
+    {
+        let mut renderers = DEVICE_RENDERERS.lock().await;
+        if let Some(renderer) = renderers.get(device_id) {
+            return Ok(renderer.clone());
+        }
+        renderers.insert(device_id.to_string(), handle.clone());
+    }
+
+    let tracker = TRACKER.lock().await.clone();
+    tracker.spawn(render_worker(
+        device_id.to_string(),
+        kind,
+        handle.clone(),
+        command_rx,
+    ));
+
+    Ok(handle)
+}
+
+async fn enqueue_render_command(
+    device: &Device,
+    device_id: &str,
+    command: RenderCommand,
+) -> Result<(), MirajazzError> {
+    for _ in 0..2 {
+        let renderer = get_device_renderer(device, device_id).await?;
+        if renderer.command_tx.send(command.clone()).is_ok() {
+            return Ok(());
+        }
+        remove_renderer_handle(device_id, &renderer).await;
+    }
+
+    log::warn!("Render queue is unavailable for device {}", device_id);
+    Err(MirajazzError::BadData)
+}
+
+async fn process_render_batch(
+    device: &Device,
+    device_id: &str,
+    button_formats: &[ImageFormat],
+    black_frames: &[Arc<DynamicImage>],
+    normalized_image_cache: &mut HashMap<u64, Arc<DynamicImage>>,
+    last_image_hashes: &mut [Option<u64>; KEY_COUNT],
+    clear_all: bool,
+    batch: RenderBatch,
+) -> Result<(), MirajazzError> {
+    let mut wrote_to_device = false;
+
+    if clear_all {
+        clear_all_button_images_with_assets(device, device_id, button_formats, black_frames)
+            .await?;
+        last_image_hashes.fill(None);
+        wrote_to_device = true;
+    }
+
+    for (index, op) in batch.into_iter().enumerate() {
+        match op {
+            Some(BatchedRenderOp::Clear) => {
+                if !should_apply_clear(last_image_hashes[index]) {
+                    continue;
+                }
+
+                clear_button_with_black_frame(
+                    device,
+                    index as u8,
+                    button_formats[index].clone(),
+                    black_frames[index].clone(),
+                )
+                .await?;
+                last_image_hashes[index] = None;
+                wrote_to_device = true;
+            }
+            Some(BatchedRenderOp::Image {
+                image_hash,
+                payload,
+            }) => {
+                if !should_apply_image(last_image_hashes[index], image_hash) {
+                    continue;
+                }
+
+                let format = button_formats[index].clone();
+                let image = match get_or_decode_cached_image(
+                    normalized_image_cache,
+                    device_id,
+                    index as u8,
+                    format.clone(),
+                    image_hash,
+                    payload,
+                )
+                .await
+                {
+                    Ok(image) => image,
+                    Err(MirajazzError::BadData | MirajazzError::ImageError(_)) => continue,
+                    Err(err) => return Err(err),
+                };
+
+                device
+                    .set_button_image(opendeck_to_device(index as u8), format, (*image).clone())
+                    .await?;
+
+                last_image_hashes[index] = Some(image_hash);
+                wrote_to_device = true;
+            }
+            None => {}
+        }
+    }
+
+    if wrote_to_device {
+        device.flush().await?;
+    }
+
+    Ok(())
+}
+
+async fn render_worker(
+    device_id: String,
+    kind: Kind,
+    handle: Arc<DeviceRenderHandle>,
+    mut command_rx: mpsc::UnboundedReceiver<RenderCommand>,
+) {
+    let (button_formats, black_frames) = build_render_assets(&kind);
+    let mut normalized_image_cache = HashMap::new();
+    let mut last_image_hashes = [None; KEY_COUNT];
+
+    loop {
+        let recv = tokio::select! {
+            recv = command_rx.recv() => recv,
+            _ = handle.shutdown_token.cancelled() => None,
+        };
+
+        let Some(command) = recv else {
+            break;
+        };
+
+        let mut batch = empty_render_batch();
+        let mut clear_all = false;
+
+        if let Err(err) = apply_render_command_to_batch(&mut batch, &mut clear_all, command) {
+            if !handle_error(&device_id, err).await {
+                break;
+            }
+            continue;
+        }
+
+        while let Ok(command) = command_rx.try_recv() {
+            if let Err(err) = apply_render_command_to_batch(&mut batch, &mut clear_all, command) {
+                if !handle_error(&device_id, err).await {
+                    remove_renderer_handle(&device_id, &handle).await;
+                    return;
+                }
+            }
+        }
+
+        let Some(device) = DEVICES.read().await.get(&device_id).cloned() else {
+            break;
+        };
+
+        if let Err(err) = process_render_batch(
+            device.as_ref(),
+            &device_id,
+            &button_formats,
+            &black_frames,
+            &mut normalized_image_cache,
+            &mut last_image_hashes,
+            clear_all,
+            batch,
+        )
+        .await
+        {
+            if !handle_error(&device_id, err).await {
+                break;
+            }
+        }
+    }
+
+    remove_renderer_handle(&device_id, &handle).await;
 }
 
 /// Handles different combinations of "set image" event, including clearing the specific buttons and whole device
 pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(), MirajazzError> {
     let device_id = evt.device.clone();
-    let image_state = get_device_image_state(device, &device_id).await?;
 
     match (evt.position, evt.image) {
         (Some(position), Some(image)) => {
-            let index = validate_button_position(position)?;
-            let image_hash = hash_image_payload(Some(image.as_str())).ok_or(MirajazzError::BadData)?;
-            {
-                let mut state_guard = image_state.state_mutex.lock().await;
-                if should_skip_image_update(
-                    state_guard.last_image_hashes[index],
-                    state_guard.pending_ops[index],
-                    image_hash,
-                ) {
-                    log::debug!("Skipping duplicate image for button {}", position);
-                    return Ok(());
-                }
-                state_guard.pending_ops[index] = Some(PendingButtonOp::Image(image_hash));
-            }
-
-            let format = image_state.button_formats[index].clone();
-            let image = match get_cached_image(&image_state, image_hash).await {
-                Some(image) => image,
-                None => {
-                    let decoded = match decode_button_image(&device_id, position, format.clone(), image.as_str()) {
-                        Ok(decoded) => decoded,
-                        Err(MirajazzError::BadData) => {
-                            clear_pending_op(
-                                &image_state,
-                                index,
-                                Some(PendingButtonOp::Image(image_hash)),
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                        Err(err) => {
-                            clear_pending_op(
-                                &image_state,
-                                index,
-                                Some(PendingButtonOp::Image(image_hash)),
-                            )
-                            .await;
-                            return Err(err);
-                        }
-                    };
-                    let decoded = Arc::new(decoded);
-                    insert_cached_image(&image_state, image_hash, decoded.clone()).await;
-                    decoded
-                }
-            };
-
-            {
-                let image_state_guard = image_state.state_mutex.lock().await;
-                if image_state_guard.pending_ops[index] != Some(PendingButtonOp::Image(image_hash)) {
-                    return Ok(());
-                }
-            }
-
-            let _io_guard = image_state.io_mutex.lock().await;
-            {
-                let image_state_guard = image_state.state_mutex.lock().await;
-                if image_state_guard.pending_ops[index] != Some(PendingButtonOp::Image(image_hash)) {
-                    return Ok(());
-                }
-            }
-            if let Err(err) = device
-                .set_button_image(opendeck_to_device(position), format, (*image).clone())
-                .await
-            {
-                drop(_io_guard);
-                clear_pending_op(&image_state, index, Some(PendingButtonOp::Image(image_hash))).await;
-                return Err(err);
-            }
-            drop(_io_guard);
-            let mut state_guard = image_state.state_mutex.lock().await;
-            if state_guard.pending_ops[index] == Some(PendingButtonOp::Image(image_hash)) {
-                state_guard.last_image_hashes[index] = Some(image_hash);
-                state_guard.pending_ops[index] = None;
-                drop(state_guard);
-                schedule_debounced_flush(&device_id, &image_state).await;
-            }
+            validate_button_position(position)?;
+            enqueue_render_command(
+                device,
+                &device_id,
+                RenderCommand::SetImage {
+                    position,
+                    image_hash: hash_image_payload(image.as_str()),
+                    payload: image,
+                },
+            )
+            .await?;
         }
         (Some(position), None) => {
-            let index = validate_button_position(position)?;
-            {
-                let mut state_guard = image_state.state_mutex.lock().await;
-                if should_skip_clear(state_guard.last_image_hashes[index], state_guard.pending_ops[index]) {
-                    log::debug!("Skipping duplicate clear for button {}", position);
-                    return Ok(());
-                }
-                state_guard.pending_ops[index] = Some(PendingButtonOp::Clear);
-            }
-
-            let format = image_state.button_formats[index].clone();
-            let black_frame = image_state.black_frames[index].clone();
-            {
-                let image_state_guard = image_state.state_mutex.lock().await;
-                if image_state_guard.pending_ops[index] != Some(PendingButtonOp::Clear) {
-                    return Ok(());
-                }
-            }
-            let _io_guard = image_state.io_mutex.lock().await;
-            {
-                let image_state_guard = image_state.state_mutex.lock().await;
-                if image_state_guard.pending_ops[index] != Some(PendingButtonOp::Clear) {
-                    return Ok(());
-                }
-            }
-            clear_button_with_black_frame(device, position, format, black_frame).await?;
-            drop(_io_guard);
-            let mut state_guard = image_state.state_mutex.lock().await;
-            if state_guard.pending_ops[index] == Some(PendingButtonOp::Clear) {
-                state_guard.last_image_hashes[index] = None;
-                state_guard.pending_ops[index] = None;
-                drop(state_guard);
-                schedule_debounced_flush(&device_id, &image_state).await;
-            }
+            validate_button_position(position)?;
+            enqueue_render_command(device, &device_id, RenderCommand::ClearButton { position })
+                .await?;
         }
         (None, None) => {
-            let _io_guard = image_state.io_mutex.lock().await;
-            if let Err(err) = device.clear_all_button_images().await {
-                log::warn!(
-                    "Failed to clear all button images natively for device {}, falling back to per-key black frames: {}",
-                    device_id,
-                    err
-                );
-
-                for position in 0..KEY_COUNT as u8 {
-                    let index = position as usize;
-                    clear_button_with_black_frame(
-                        device,
-                        position,
-                        image_state.button_formats[index].clone(),
-                        image_state.black_frames[index].clone(),
-                    )
-                    .await?;
-                }
-            }
-            drop(_io_guard);
-            let mut state_guard = image_state.state_mutex.lock().await;
-            state_guard.last_image_hashes.fill(None);
-            state_guard.pending_ops.fill(None);
-            drop(state_guard);
-            schedule_debounced_flush(&device_id, &image_state).await;
+            enqueue_render_command(device, &device_id, RenderCommand::ClearAll).await?;
         }
         _ => {}
     }
@@ -702,47 +833,102 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingButtonOp, should_skip_clear, should_skip_image_update};
+    use super::{
+        BatchedRenderOp, RenderCommand, apply_render_command_to_batch, empty_render_batch,
+        should_apply_clear, should_apply_image,
+    };
 
     #[test]
-    fn duplicate_image_update_is_skipped_when_already_applied() {
-        assert!(should_skip_image_update(
-            Some(42),
-            Some(PendingButtonOp::Clear),
-            42,
-        ));
+    fn duplicate_applied_image_is_skipped() {
+        assert!(!should_apply_image(Some(42), 42));
     }
 
     #[test]
-    fn duplicate_image_update_is_skipped_when_same_image_is_pending() {
-        assert!(should_skip_image_update(
-            None,
-            Some(PendingButtonOp::Image(42)),
-            42,
-        ));
-    }
-
-    #[test]
-    fn newer_pending_image_replaces_older_one() {
-        assert!(!should_skip_image_update(
-            Some(11),
-            Some(PendingButtonOp::Image(22)),
-            33,
-        ));
+    fn newer_image_is_applied() {
+        assert!(should_apply_image(Some(11), 33));
     }
 
     #[test]
     fn clear_is_skipped_when_button_is_already_empty() {
-        assert!(should_skip_clear(None, None));
+        assert!(!should_apply_clear(None));
     }
 
     #[test]
-    fn clear_is_skipped_when_clear_is_already_pending() {
-        assert!(should_skip_clear(None, Some(PendingButtonOp::Clear)));
+    fn clear_is_applied_when_button_has_content() {
+        assert!(should_apply_clear(Some(7)));
     }
 
     #[test]
-    fn clear_is_not_skipped_when_an_image_is_pending() {
-        assert!(!should_skip_clear(None, Some(PendingButtonOp::Image(7))));
+    fn latest_command_wins_for_same_button() {
+        let mut batch = empty_render_batch();
+        let mut clear_all = false;
+
+        apply_render_command_to_batch(
+            &mut batch,
+            &mut clear_all,
+            RenderCommand::SetImage {
+                position: 2,
+                image_hash: 10,
+                payload: "a".to_string(),
+            },
+        )
+        .unwrap();
+        apply_render_command_to_batch(
+            &mut batch,
+            &mut clear_all,
+            RenderCommand::ClearButton { position: 2 },
+        )
+        .unwrap();
+
+        assert!(!clear_all);
+        assert_eq!(batch[2], Some(BatchedRenderOp::Clear));
+    }
+
+    #[test]
+    fn clear_all_discards_previous_button_batch() {
+        let mut batch = empty_render_batch();
+        let mut clear_all = false;
+
+        apply_render_command_to_batch(
+            &mut batch,
+            &mut clear_all,
+            RenderCommand::SetImage {
+                position: 1,
+                image_hash: 10,
+                payload: "a".to_string(),
+            },
+        )
+        .unwrap();
+        apply_render_command_to_batch(&mut batch, &mut clear_all, RenderCommand::ClearAll).unwrap();
+
+        assert!(clear_all);
+        assert!(batch.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn updates_after_clear_all_are_preserved() {
+        let mut batch = empty_render_batch();
+        let mut clear_all = false;
+
+        apply_render_command_to_batch(&mut batch, &mut clear_all, RenderCommand::ClearAll).unwrap();
+        apply_render_command_to_batch(
+            &mut batch,
+            &mut clear_all,
+            RenderCommand::SetImage {
+                position: 4,
+                image_hash: 99,
+                payload: "b".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(clear_all);
+        assert_eq!(
+            batch[4],
+            Some(BatchedRenderOp::Image {
+                image_hash: 99,
+                payload: "b".to_string(),
+            })
+        );
     }
 }

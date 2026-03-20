@@ -1,9 +1,8 @@
 use device::{handle_error, handle_set_image};
 use mirajazz::device::Device;
-use mirajazz::types::ImageFormat;
 use openaction::*;
 use std::{collections::HashMap, sync::Arc, sync::LazyLock};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use watcher::watcher_task;
 
@@ -20,38 +19,6 @@ pub static DEVICES: LazyLock<RwLock<HashMap<String, Arc<Device>>>> =
 pub static TOKENS: LazyLock<RwLock<HashMap<String, CancellationToken>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 pub static TRACKER: LazyLock<Mutex<TaskTracker>> = LazyLock::new(|| Mutex::new(TaskTracker::new()));
-pub static DEVICE_IMAGE_STATES: LazyLock<Mutex<HashMap<String, Arc<DeviceImageState>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub struct DeviceImageState {
-    pub state_mutex: Mutex<DeviceImageStateInner>,
-    pub io_mutex: Mutex<()>,
-    pub button_formats: Vec<ImageFormat>,
-    pub black_frames: Vec<Arc<image::DynamicImage>>,
-    pub normalized_image_cache: Mutex<HashMap<u64, Arc<image::DynamicImage>>>,
-    pub flush_tx: mpsc::Sender<()>,
-    pub shutdown_token: CancellationToken,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PendingButtonOp {
-    Clear,
-    Image(u64),
-}
-
-pub struct DeviceImageStateInner {
-    pub last_image_hashes: [Option<u64>; mappings::KEY_COUNT],
-    pub pending_ops: [Option<PendingButtonOp>; mappings::KEY_COUNT],
-}
-
-impl Default for DeviceImageStateInner {
-    fn default() -> Self {
-        Self {
-            last_image_hashes: [None; mappings::KEY_COUNT],
-            pending_ops: [None; mappings::KEY_COUNT],
-        }
-    }
-}
 
 struct GlobalEventHandler {}
 impl openaction::GlobalEventHandler for GlobalEventHandler {
