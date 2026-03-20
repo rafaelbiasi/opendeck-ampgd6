@@ -1,5 +1,6 @@
 use device::{handle_error, handle_set_image};
 use mirajazz::device::Device;
+use mirajazz::types::ImageFormat;
 use openaction::*;
 use std::{collections::HashMap, sync::Arc, sync::LazyLock};
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -25,20 +26,29 @@ pub static DEVICE_IMAGE_STATES: LazyLock<Mutex<HashMap<String, Arc<DeviceImageSt
 pub struct DeviceImageState {
     pub state_mutex: Mutex<DeviceImageStateInner>,
     pub io_mutex: Mutex<()>,
+    pub button_formats: Vec<ImageFormat>,
+    pub black_frames: Vec<Arc<image::DynamicImage>>,
+    pub normalized_image_cache: Mutex<HashMap<u64, Arc<image::DynamicImage>>>,
     pub flush_tx: mpsc::Sender<()>,
     pub shutdown_token: CancellationToken,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingButtonOp {
+    Clear,
+    Image(u64),
+}
+
 pub struct DeviceImageStateInner {
     pub last_image_hashes: [Option<u64>; mappings::KEY_COUNT],
-    pub pending_image_hashes: [Option<u64>; mappings::KEY_COUNT],
+    pub pending_ops: [Option<PendingButtonOp>; mappings::KEY_COUNT],
 }
 
 impl Default for DeviceImageStateInner {
     fn default() -> Self {
         Self {
             last_image_hashes: [None; mappings::KEY_COUNT],
-            pending_image_hashes: [None; mappings::KEY_COUNT],
+            pending_ops: [None; mappings::KEY_COUNT],
         }
     }
 }

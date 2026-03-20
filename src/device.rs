@@ -6,6 +6,7 @@ use image::{
 use mirajazz::{device::Device, error::MirajazzError, state::DeviceStateUpdate};
 use openaction::{OUTBOUND_EVENT_MANAGER, SetImageEvent};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    DEVICE_IMAGE_STATES, DEVICES, DeviceImageState, TOKENS, TRACKER,
+    DEVICE_IMAGE_STATES, DEVICES, DeviceImageState, PendingButtonOp, TOKENS, TRACKER,
     inputs::{apply_input_event, decode_input_report, ignore_process_input, opendeck_to_device},
     mappings::{
         COL_COUNT, CandidateDevice, ENCODER_COUNT, KEY_COUNT, Kind, ROW_COUNT,
@@ -21,7 +22,8 @@ use crate::{
     },
 };
 
-const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(15);
+const IMAGE_FLUSH_DEBOUNCE: Duration = Duration::from_millis(5);
+const IMAGE_CACHE_LIMIT: usize = 64;
 
 /// Initializes a device and listens for events
 pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
@@ -62,9 +64,15 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
                 "Failed to clear all button images with native command, falling back to per-key black frames: {}",
                 e
             );
+            let kind = resolve_device_kind(&device, &candidate.id)?;
 
             for position in 0..KEY_COUNT as u8 {
-                if let Err(e) = clear_button_with_black_frame(&device, position).await {
+                let format = get_image_format_for_key(&kind, position);
+                let black_frame =
+                    Arc::new(blank_button_image(format.size.0 as u32, format.size.1 as u32));
+                if let Err(e) =
+                    clear_button_with_black_frame(&device, position, format, black_frame).await
+                {
                     log::warn!(
                         "Failed to clear button {} during init fallback (this may be normal for this device): {}",
                         position,
@@ -322,26 +330,18 @@ fn blank_button_image(width: u32, height: u32) -> DynamicImage {
     DynamicImage::ImageRgb8(blank)
 }
 
-async fn clear_button_with_black_frame(device: &Device, position: u8) -> Result<(), MirajazzError> {
-    let kind = Kind::from_vid_pid(device.vid, device.pid).ok_or_else(|| {
-        log::error!(
-            "Unable to resolve device kind while clearing button: vid={:#06x}, pid={:#06x}, position={}",
-            device.vid,
-            device.pid,
-            position
-        );
-        MirajazzError::BadData
-    })?;
-    let format = get_image_format_for_key(&kind, position);
-    let image = blank_button_image(format.size.0 as u32, format.size.1 as u32);
-
+async fn clear_button_with_black_frame(
+    device: &Device,
+    position: u8,
+    format: mirajazz::types::ImageFormat,
+    image: Arc<DynamicImage>,
+) -> Result<(), MirajazzError> {
     device
-        .set_button_image(opendeck_to_device(position), format, image)
+        .set_button_image(opendeck_to_device(position), format, (*image).clone())
         .await
 }
 
-async fn schedule_debounced_flush(device_id: String) {
-    let image_state = get_device_image_state(&device_id).await;
+async fn schedule_debounced_flush(device_id: &str, image_state: &Arc<DeviceImageState>) {
     if image_state.flush_tx.try_send(()).is_err() {
         log::debug!("Debounced flush already pending for device {}", device_id);
     }
@@ -382,17 +382,43 @@ async fn debounced_flush_worker(
     }
 }
 
-async fn get_device_image_state(device_id: &str) -> Arc<DeviceImageState> {
+fn resolve_device_kind(device: &Device, device_id: &str) -> Result<Kind, MirajazzError> {
+    Kind::from_vid_pid(device.vid, device.pid).ok_or_else(|| {
+        log::error!(
+            "Unable to resolve device kind: vid={:#06x}, pid={:#06x}, device_id={}",
+            device.vid,
+            device.pid,
+            device_id
+        );
+        MirajazzError::BadData
+    })
+}
+
+async fn get_device_image_state(
+    device: &Device,
+    device_id: &str,
+) -> Result<Arc<DeviceImageState>, MirajazzError> {
     let (state, flush_rx) = {
         let mut states = DEVICE_IMAGE_STATES.lock().await;
         if let Some(state) = states.get(device_id) {
-            return state.clone();
+            return Ok(state.clone());
         }
 
+        let kind = resolve_device_kind(device, device_id)?;
+        let button_formats = (0..KEY_COUNT)
+            .map(|position| get_image_format_for_key(&kind, position as u8))
+            .collect::<Vec<_>>();
+        let black_frames = button_formats
+            .iter()
+            .map(|format| Arc::new(blank_button_image(format.size.0 as u32, format.size.1 as u32)))
+            .collect::<Vec<_>>();
         let (flush_tx, flush_rx) = mpsc::channel(1);
         let state = Arc::new(DeviceImageState {
             state_mutex: tokio::sync::Mutex::new(Default::default()),
             io_mutex: tokio::sync::Mutex::new(()),
+            button_formats,
+            black_frames,
+            normalized_image_cache: tokio::sync::Mutex::new(HashMap::new()),
             flush_tx,
             shutdown_token: CancellationToken::new(),
         });
@@ -409,7 +435,7 @@ async fn get_device_image_state(device_id: &str) -> Arc<DeviceImageState> {
         flush_rx,
     ));
 
-    state
+    Ok(state)
 }
 
 fn hash_image_payload(image: Option<&str>) -> Option<u64> {
@@ -435,11 +461,11 @@ fn validate_button_position(position: u8) -> Result<usize, MirajazzError> {
 }
 
 fn decode_button_image(
-    device: &Device,
     device_id: &str,
     position: u8,
+    format: mirajazz::types::ImageFormat,
     image: &str,
-) -> Result<(mirajazz::types::ImageFormat, DynamicImage), MirajazzError> {
+) -> Result<DynamicImage, MirajazzError> {
     let url = match DataUrl::process(image) {
         Ok(url) => url,
         Err(err) => {
@@ -471,100 +497,175 @@ fn decode_button_image(
     }
 
     let image = load_from_memory_with_format(body.as_slice(), image::ImageFormat::Jpeg)?;
-    let kind = Kind::from_vid_pid(device.vid, device.pid).ok_or_else(|| {
-        log::error!(
-            "Unable to resolve device kind while setting image: vid={:#06x}, pid={:#06x}, device_id={}, button={}",
-            device.vid,
-            device.pid,
-            device_id,
-            position
-        );
-        MirajazzError::BadData
-    })?;
-    let format = get_image_format_for_key(&kind, position);
-    let image = normalize_button_image(image, format.size.0 as u32, format.size.1 as u32);
-
-    Ok((format, image))
+    Ok(normalize_button_image(
+        image,
+        format.size.0 as u32,
+        format.size.1 as u32,
+    ))
 }
 
-async fn clear_pending_image_hash(
+async fn clear_pending_op(
     image_state: &Arc<DeviceImageState>,
     index: usize,
-    image_hash: Option<u64>,
+    pending_op: Option<PendingButtonOp>,
 ) {
     let mut image_state = image_state.state_mutex.lock().await;
-    if image_state.pending_image_hashes[index] == image_hash {
-        image_state.pending_image_hashes[index] = None;
+    if image_state.pending_ops[index] == pending_op {
+        image_state.pending_ops[index] = None;
     }
+}
+
+fn should_skip_image_update(
+    last_image_hash: Option<u64>,
+    pending_op: Option<PendingButtonOp>,
+    image_hash: u64,
+) -> bool {
+    last_image_hash == Some(image_hash) || pending_op == Some(PendingButtonOp::Image(image_hash))
+}
+
+fn should_skip_clear(last_image_hash: Option<u64>, pending_op: Option<PendingButtonOp>) -> bool {
+    last_image_hash.is_none() && pending_op.is_none_or(|op| op == PendingButtonOp::Clear)
+}
+
+async fn get_cached_image(
+    image_state: &Arc<DeviceImageState>,
+    image_hash: u64,
+) -> Option<Arc<DynamicImage>> {
+    let cache = image_state.normalized_image_cache.lock().await;
+    cache.get(&image_hash).cloned()
+}
+
+async fn insert_cached_image(
+    image_state: &Arc<DeviceImageState>,
+    image_hash: u64,
+    image: Arc<DynamicImage>,
+) {
+    let mut cache = image_state.normalized_image_cache.lock().await;
+    if cache.len() >= IMAGE_CACHE_LIMIT && !cache.contains_key(&image_hash) {
+        cache.clear();
+    }
+    cache.insert(image_hash, image);
 }
 
 /// Handles different combinations of "set image" event, including clearing the specific buttons and whole device
 pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(), MirajazzError> {
     let device_id = evt.device.clone();
-    let image_state = get_device_image_state(&device_id).await;
+    let image_state = get_device_image_state(device, &device_id).await?;
 
     match (evt.position, evt.image) {
         (Some(position), Some(image)) => {
             let index = validate_button_position(position)?;
-            let image_hash = hash_image_payload(Some(image.as_str()));
+            let image_hash = hash_image_payload(Some(image.as_str())).ok_or(MirajazzError::BadData)?;
             {
-                let mut image_state = image_state.state_mutex.lock().await;
-                if image_state.last_image_hashes[index] == image_hash
-                    || image_state.pending_image_hashes[index] == image_hash
-                {
+                let mut state_guard = image_state.state_mutex.lock().await;
+                if should_skip_image_update(
+                    state_guard.last_image_hashes[index],
+                    state_guard.pending_ops[index],
+                    image_hash,
+                ) {
                     log::debug!("Skipping duplicate image for button {}", position);
                     return Ok(());
                 }
-                image_state.pending_image_hashes[index] = image_hash;
+                state_guard.pending_ops[index] = Some(PendingButtonOp::Image(image_hash));
             }
 
-            let (format, image) =
-                match decode_button_image(device, &device_id, position, image.as_str()) {
-                    Ok(decoded) => decoded,
-                    Err(MirajazzError::BadData) => {
-                        clear_pending_image_hash(&image_state, index, image_hash).await;
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        clear_pending_image_hash(&image_state, index, image_hash).await;
-                        return Err(err);
-                    }
-                };
+            let format = image_state.button_formats[index].clone();
+            let image = match get_cached_image(&image_state, image_hash).await {
+                Some(image) => image,
+                None => {
+                    let decoded = match decode_button_image(&device_id, position, format.clone(), image.as_str()) {
+                        Ok(decoded) => decoded,
+                        Err(MirajazzError::BadData) => {
+                            clear_pending_op(
+                                &image_state,
+                                index,
+                                Some(PendingButtonOp::Image(image_hash)),
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            clear_pending_op(
+                                &image_state,
+                                index,
+                                Some(PendingButtonOp::Image(image_hash)),
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    };
+                    let decoded = Arc::new(decoded);
+                    insert_cached_image(&image_state, image_hash, decoded.clone()).await;
+                    decoded
+                }
+            };
+
+            {
+                let image_state_guard = image_state.state_mutex.lock().await;
+                if image_state_guard.pending_ops[index] != Some(PendingButtonOp::Image(image_hash)) {
+                    return Ok(());
+                }
+            }
+
             let _io_guard = image_state.io_mutex.lock().await;
+            {
+                let image_state_guard = image_state.state_mutex.lock().await;
+                if image_state_guard.pending_ops[index] != Some(PendingButtonOp::Image(image_hash)) {
+                    return Ok(());
+                }
+            }
             if let Err(err) = device
-                .set_button_image(opendeck_to_device(position), format, image)
+                .set_button_image(opendeck_to_device(position), format, (*image).clone())
                 .await
             {
                 drop(_io_guard);
-                clear_pending_image_hash(&image_state, index, image_hash).await;
+                clear_pending_op(&image_state, index, Some(PendingButtonOp::Image(image_hash))).await;
                 return Err(err);
             }
             drop(_io_guard);
-            let mut image_state = image_state.state_mutex.lock().await;
-            image_state.last_image_hashes[index] = image_hash;
-            image_state.pending_image_hashes[index] = None;
-            schedule_debounced_flush(device_id).await;
+            let mut state_guard = image_state.state_mutex.lock().await;
+            if state_guard.pending_ops[index] == Some(PendingButtonOp::Image(image_hash)) {
+                state_guard.last_image_hashes[index] = Some(image_hash);
+                state_guard.pending_ops[index] = None;
+                drop(state_guard);
+                schedule_debounced_flush(&device_id, &image_state).await;
+            }
         }
         (Some(position), None) => {
             let index = validate_button_position(position)?;
             {
-                let mut image_state = image_state.state_mutex.lock().await;
-                if image_state.last_image_hashes[index].is_none()
-                    && image_state.pending_image_hashes[index].is_none()
-                {
+                let mut state_guard = image_state.state_mutex.lock().await;
+                if should_skip_clear(state_guard.last_image_hashes[index], state_guard.pending_ops[index]) {
                     log::debug!("Skipping duplicate clear for button {}", position);
                     return Ok(());
                 }
-                image_state.pending_image_hashes[index] = None;
+                state_guard.pending_ops[index] = Some(PendingButtonOp::Clear);
             }
 
+            let format = image_state.button_formats[index].clone();
+            let black_frame = image_state.black_frames[index].clone();
+            {
+                let image_state_guard = image_state.state_mutex.lock().await;
+                if image_state_guard.pending_ops[index] != Some(PendingButtonOp::Clear) {
+                    return Ok(());
+                }
+            }
             let _io_guard = image_state.io_mutex.lock().await;
-            clear_button_with_black_frame(device, position).await?;
+            {
+                let image_state_guard = image_state.state_mutex.lock().await;
+                if image_state_guard.pending_ops[index] != Some(PendingButtonOp::Clear) {
+                    return Ok(());
+                }
+            }
+            clear_button_with_black_frame(device, position, format, black_frame).await?;
             drop(_io_guard);
-            let mut image_state = image_state.state_mutex.lock().await;
-            image_state.last_image_hashes[index] = None;
-            image_state.pending_image_hashes[index] = None;
-            schedule_debounced_flush(device_id).await;
+            let mut state_guard = image_state.state_mutex.lock().await;
+            if state_guard.pending_ops[index] == Some(PendingButtonOp::Clear) {
+                state_guard.last_image_hashes[index] = None;
+                state_guard.pending_ops[index] = None;
+                drop(state_guard);
+                schedule_debounced_flush(&device_id, &image_state).await;
+            }
         }
         (None, None) => {
             let _io_guard = image_state.io_mutex.lock().await;
@@ -576,17 +677,72 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
                 );
 
                 for position in 0..KEY_COUNT as u8 {
-                    clear_button_with_black_frame(device, position).await?;
+                    let index = position as usize;
+                    clear_button_with_black_frame(
+                        device,
+                        position,
+                        image_state.button_formats[index].clone(),
+                        image_state.black_frames[index].clone(),
+                    )
+                    .await?;
                 }
             }
             drop(_io_guard);
-            let mut image_state = image_state.state_mutex.lock().await;
-            image_state.last_image_hashes.fill(None);
-            image_state.pending_image_hashes.fill(None);
-            schedule_debounced_flush(device_id).await;
+            let mut state_guard = image_state.state_mutex.lock().await;
+            state_guard.last_image_hashes.fill(None);
+            state_guard.pending_ops.fill(None);
+            drop(state_guard);
+            schedule_debounced_flush(&device_id, &image_state).await;
         }
         _ => {}
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PendingButtonOp, should_skip_clear, should_skip_image_update};
+
+    #[test]
+    fn duplicate_image_update_is_skipped_when_already_applied() {
+        assert!(should_skip_image_update(
+            Some(42),
+            Some(PendingButtonOp::Clear),
+            42,
+        ));
+    }
+
+    #[test]
+    fn duplicate_image_update_is_skipped_when_same_image_is_pending() {
+        assert!(should_skip_image_update(
+            None,
+            Some(PendingButtonOp::Image(42)),
+            42,
+        ));
+    }
+
+    #[test]
+    fn newer_pending_image_replaces_older_one() {
+        assert!(!should_skip_image_update(
+            Some(11),
+            Some(PendingButtonOp::Image(22)),
+            33,
+        ));
+    }
+
+    #[test]
+    fn clear_is_skipped_when_button_is_already_empty() {
+        assert!(should_skip_clear(None, None));
+    }
+
+    #[test]
+    fn clear_is_skipped_when_clear_is_already_pending() {
+        assert!(should_skip_clear(None, Some(PendingButtonOp::Clear)));
+    }
+
+    #[test]
+    fn clear_is_not_skipped_when_an_image_is_pending() {
+        assert!(!should_skip_clear(None, Some(PendingButtonOp::Image(7))));
+    }
 }
