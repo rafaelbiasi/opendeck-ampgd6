@@ -30,6 +30,7 @@ use crate::{
 };
 
 const IMAGE_CACHE_LIMIT: usize = 64;
+const CLEAR_ALL_BATCH_WINDOW: Duration = Duration::from_millis(12);
 
 static DEVICE_RENDERERS: LazyLock<Mutex<HashMap<String, Arc<DeviceRenderHandle>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -484,6 +485,16 @@ fn empty_render_batch() -> RenderBatch {
     array::from_fn(|_| None)
 }
 
+fn should_wait_for_follow_up_batch(command: &RenderCommand) -> bool {
+    matches!(command, RenderCommand::ClearAll)
+}
+
+fn batch_contains_image_updates(batch: &RenderBatch) -> bool {
+    batch
+        .iter()
+        .any(|op| matches!(op, Some(BatchedRenderOp::Image { .. })))
+}
+
 fn apply_render_command_to_batch(
     batch: &mut RenderBatch,
     clear_all: &mut bool,
@@ -670,10 +681,28 @@ async fn process_render_batch(
     let mut wrote_to_device = false;
 
     if clear_all {
-        clear_all_button_images_with_assets(device, device_id, button_formats, black_frames)
-            .await?;
-        last_image_hashes.fill(None);
-        wrote_to_device = true;
+        if batch_contains_image_updates(&batch) {
+            for index in 0..KEY_COUNT {
+                if batch[index].is_some() || !should_apply_clear(last_image_hashes[index]) {
+                    continue;
+                }
+
+                clear_button_with_black_frame(
+                    device,
+                    index as u8,
+                    button_formats[index].clone(),
+                    black_frames[index].clone(),
+                )
+                .await?;
+                last_image_hashes[index] = None;
+                wrote_to_device = true;
+            }
+        } else {
+            clear_all_button_images_with_assets(device, device_id, button_formats, black_frames)
+                .await?;
+            last_image_hashes.fill(None);
+            wrote_to_device = true;
+        }
     }
 
     for (index, op) in batch.into_iter().enumerate() {
@@ -758,6 +787,15 @@ async fn render_worker(
         let mut batch = empty_render_batch();
         let mut clear_all = false;
 
+        if should_wait_for_follow_up_batch(&command) {
+            // Page switches often send a clear followed immediately by a burst of new images.
+            // A short wait lets us coalesce that burst into a single device flush.
+            tokio::select! {
+                _ = tokio::time::sleep(CLEAR_ALL_BATCH_WINDOW) => {},
+                _ = handle.shutdown_token.cancelled() => break,
+            }
+        }
+
         if let Err(err) = apply_render_command_to_batch(&mut batch, &mut clear_all, command) {
             if !handle_error(&device_id, err).await {
                 break;
@@ -834,8 +872,9 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchedRenderOp, RenderCommand, apply_render_command_to_batch, empty_render_batch,
-        should_apply_clear, should_apply_image,
+        BatchedRenderOp, RenderCommand, apply_render_command_to_batch,
+        batch_contains_image_updates, empty_render_batch, should_apply_clear, should_apply_image,
+        should_wait_for_follow_up_batch,
     };
 
     #[test]
@@ -930,5 +969,57 @@ mod tests {
                 payload: "b".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn clear_all_waits_for_follow_up_batch() {
+        assert!(should_wait_for_follow_up_batch(&RenderCommand::ClearAll));
+    }
+
+    #[test]
+    fn regular_image_update_does_not_wait_for_follow_up_batch() {
+        assert!(!should_wait_for_follow_up_batch(&RenderCommand::SetImage {
+            position: 0,
+            image_hash: 1,
+            payload: "a".to_string(),
+        }));
+    }
+
+    #[test]
+    fn clear_all_batch_with_images_avoids_native_clear_path() {
+        let mut batch = empty_render_batch();
+        let mut clear_all = false;
+
+        apply_render_command_to_batch(&mut batch, &mut clear_all, RenderCommand::ClearAll).unwrap();
+        apply_render_command_to_batch(
+            &mut batch,
+            &mut clear_all,
+            RenderCommand::SetImage {
+                position: 3,
+                image_hash: 55,
+                payload: "x".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(clear_all);
+        assert!(batch_contains_image_updates(&batch));
+    }
+
+    #[test]
+    fn clear_only_batch_keeps_native_clear_path_available() {
+        let mut batch = empty_render_batch();
+        let mut clear_all = false;
+
+        apply_render_command_to_batch(&mut batch, &mut clear_all, RenderCommand::ClearAll).unwrap();
+        apply_render_command_to_batch(
+            &mut batch,
+            &mut clear_all,
+            RenderCommand::ClearButton { position: 3 },
+        )
+        .unwrap();
+
+        assert!(clear_all);
+        assert!(!batch_contains_image_updates(&batch));
     }
 }
