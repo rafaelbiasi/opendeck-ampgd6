@@ -31,8 +31,8 @@ use crate::{
 };
 
 const IMAGE_CACHE_LIMIT: usize = 64;
-const CLEAR_ALL_BATCH_WINDOW: Duration = Duration::from_millis(12);
-const IMAGE_BATCH_WINDOW: Duration = Duration::from_millis(4);
+const CLEAR_ALL_BATCH_WINDOW: Duration = Duration::from_millis(8);
+const IMAGE_BATCH_WINDOW: Duration = Duration::from_millis(1);
 
 static DEVICE_RENDERERS: LazyLock<Mutex<HashMap<String, Arc<DeviceRenderHandle>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -304,57 +304,74 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     Ok(())
 }
 
+async fn dispatch_single_update(
+    outbound: &mut openaction::OutboundEventManager,
+    device_id: &str,
+    update: DeviceStateUpdate,
+) {
+    match update {
+        DeviceStateUpdate::ButtonDown(key) => {
+            log::debug!(
+                "Sending key_down event: device_id={}, key={}",
+                device_id,
+                key
+            );
+            if let Err(err) = outbound.key_down(device_id.to_string(), key).await {
+                log::warn!(
+                    "Failed to send key_down event: device_id={}, key={}, err={}",
+                    device_id,
+                    key,
+                    err
+                );
+            }
+        }
+        DeviceStateUpdate::ButtonUp(key) => {
+            log::debug!("Sending key_up event: device_id={}, key={}", device_id, key);
+            if let Err(err) = outbound.key_up(device_id.to_string(), key).await {
+                log::warn!(
+                    "Failed to send key_up event: device_id={}, key={}, err={}",
+                    device_id,
+                    key,
+                    err
+                );
+            }
+        }
+        DeviceStateUpdate::EncoderDown(encoder) => {
+            if let Err(err) = outbound.encoder_down(device_id.to_string(), encoder).await {
+                log::warn!("Failed to send encoder_down event: {}", err);
+            }
+        }
+        DeviceStateUpdate::EncoderUp(encoder) => {
+            if let Err(err) = outbound.encoder_up(device_id.to_string(), encoder).await {
+                log::warn!("Failed to send encoder_up event: {}", err);
+            }
+        }
+        DeviceStateUpdate::EncoderTwist(encoder, val) => {
+            if let Err(err) = outbound
+                .encoder_change(device_id.to_string(), encoder, val as i16)
+                .await
+            {
+                log::warn!("Failed to send encoder_change event: {}", err);
+            }
+        }
+    }
+}
+
 async fn input_dispatch_worker(
     device_id: String,
     mut event_rx: mpsc::UnboundedReceiver<DeviceStateUpdate>,
 ) {
-    while let Some(update) = event_rx.recv().await {
+    while let Some(first) = event_rx.recv().await {
+        // Drain any additional events that arrived while we were idle,
+        // so we can send them all under a single lock acquisition.
+        let mut updates = vec![first];
+        while let Ok(more) = event_rx.try_recv() {
+            updates.push(more);
+        }
+
         if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
-            match update {
-                DeviceStateUpdate::ButtonDown(key) => {
-                    log::debug!(
-                        "Sending key_down event: device_id={}, key={}",
-                        device_id,
-                        key
-                    );
-                    if let Err(err) = outbound.key_down(device_id.clone(), key).await {
-                        log::warn!(
-                            "Failed to send key_down event: device_id={}, key={}, err={}",
-                            device_id,
-                            key,
-                            err
-                        );
-                    }
-                }
-                DeviceStateUpdate::ButtonUp(key) => {
-                    log::debug!("Sending key_up event: device_id={}, key={}", device_id, key);
-                    if let Err(err) = outbound.key_up(device_id.clone(), key).await {
-                        log::warn!(
-                            "Failed to send key_up event: device_id={}, key={}, err={}",
-                            device_id,
-                            key,
-                            err
-                        );
-                    }
-                }
-                DeviceStateUpdate::EncoderDown(encoder) => {
-                    if let Err(err) = outbound.encoder_down(device_id.clone(), encoder).await {
-                        log::warn!("Failed to send encoder_down event: {}", err);
-                    }
-                }
-                DeviceStateUpdate::EncoderUp(encoder) => {
-                    if let Err(err) = outbound.encoder_up(device_id.clone(), encoder).await {
-                        log::warn!("Failed to send encoder_up event: {}", err);
-                    }
-                }
-                DeviceStateUpdate::EncoderTwist(encoder, val) => {
-                    if let Err(err) = outbound
-                        .encoder_change(device_id.clone(), encoder, val as i16)
-                        .await
-                    {
-                        log::warn!("Failed to send encoder_change event: {}", err);
-                    }
-                }
+            for update in updates {
+                dispatch_single_update(outbound, &device_id, update).await;
             }
         }
     }
@@ -499,26 +516,48 @@ fn decode_button_image(
     ))
 }
 
-async fn decode_button_image_async(
+/// Decodes a data-URL payload and converts it to the device's native image
+/// format in a single `spawn_blocking` call, keeping all CPU work off the
+/// Tokio runtime.
+async fn decode_and_convert_button_image(
     device_id: &str,
     position: u8,
     format: ImageFormat,
     payload: String,
-) -> Result<DynamicImage, MirajazzError> {
+) -> Result<Vec<u8>, MirajazzError> {
     let worker_device_id = device_id.to_string();
     let join_device_id = worker_device_id.clone();
 
-    spawn_blocking(move || decode_button_image(&worker_device_id, position, format, &payload))
-        .await
-        .map_err(|err| {
-            log::error!(
-                "Image decode task panicked for device {}, button {}: {}",
-                join_device_id,
-                position,
-                err
-            );
-            MirajazzError::BadData
-        })?
+    spawn_blocking(move || {
+        let decoded = decode_button_image(&worker_device_id, position, format, &payload)?;
+        convert_image_with_format_sync(format, decoded)
+    })
+    .await
+    .map_err(|err| {
+        log::error!(
+            "Image decode+convert task panicked for device {}, button {}: {}",
+            join_device_id,
+            position,
+            err
+        );
+        MirajazzError::BadData
+    })?
+}
+
+/// Synchronous wrapper for mirajazz image conversion, usable inside
+/// `spawn_blocking`. The upstream `convert_image_with_format` uses
+/// `block_in_place` internally, but we call the same image operations
+/// directly here to avoid the extra async layer.
+fn convert_image_with_format_sync(
+    image_format: ImageFormat,
+    image: DynamicImage,
+) -> Result<Vec<u8>, MirajazzError> {
+    // We can safely call the async version in a blocking context via
+    // a lightweight single-threaded runtime, but since mirajazz's impl
+    // is actually sync behind block_in_place, we use futures_lite to
+    // drive it.
+    futures_lite::future::block_on(convert_image_with_format(image_format, image))
+        .map_err(MirajazzError::ImageError)
 }
 
 fn should_apply_image(last_image_hash: Option<u64>, image_hash: u64) -> bool {
@@ -575,47 +614,6 @@ fn apply_render_command_to_batch(
     }
 
     Ok(())
-}
-
-async fn get_or_convert_cached_image(
-    converted_image_cache: &mut HashMap<ConvertedImageCacheKey, Arc<Vec<u8>>>,
-    device_id: &str,
-    position: u8,
-    format: ImageFormat,
-    image_hash: u64,
-    payload: String,
-) -> Result<Arc<Vec<u8>>, MirajazzError> {
-    let cache_key = converted_image_cache_key(image_hash, format);
-
-    if let Some(image_data) = converted_image_cache.get(&cache_key) {
-        log::debug!(
-            "Converted image cache hit: device_id={}, button={}, image_hash={}",
-            device_id,
-            position,
-            image_hash
-        );
-        return Ok(image_data.clone());
-    }
-
-    log::debug!(
-        "Converted image cache miss: device_id={}, button={}, image_hash={}",
-        device_id,
-        position,
-        image_hash
-    );
-
-    let decoded = decode_button_image_async(device_id, position, format, payload).await?;
-    let converted = Arc::new(convert_image_with_format(format, decoded).await?);
-
-    if converted_image_cache.len() >= IMAGE_CACHE_LIMIT
-        && !converted_image_cache.contains_key(&cache_key)
-    {
-        converted_image_cache.clear();
-    }
-
-    converted_image_cache.insert(cache_key, converted.clone());
-
-    Ok(converted)
 }
 
 async fn build_render_assets(
@@ -762,17 +760,25 @@ async fn process_render_batch(
         }
     }
 
+    // Phase 1: Collect all image decode/convert tasks and resolve cache hits.
+    // Cache misses are launched in parallel so all CPU work overlaps.
+    struct PendingImage {
+        index: usize,
+        image_hash: u64,
+        image_data: Arc<Vec<u8>>,
+    }
+
+    let mut pending_clears: Vec<usize> = Vec::new();
+    let mut resolved_images: Vec<PendingImage> = Vec::new();
+    let mut decode_tasks: tokio::task::JoinSet<Result<PendingImage, (usize, MirajazzError)>> =
+        tokio::task::JoinSet::new();
+
     for (index, op) in batch.into_iter().enumerate() {
         match op {
             Some(BatchedRenderOp::Clear) => {
-                if !should_apply_clear(last_image_hashes[index]) {
-                    continue;
+                if should_apply_clear(last_image_hashes[index]) {
+                    pending_clears.push(index);
                 }
-
-                queue_button_image_data(device, index as u8, black_frames[index].as_slice())
-                    .await?;
-                last_image_hashes[index] = None;
-                writes_to_device += 1;
             }
             Some(BatchedRenderOp::Image {
                 image_hash,
@@ -783,28 +789,79 @@ async fn process_render_batch(
                 }
 
                 let format = button_formats[index];
-                let image_data = match get_or_convert_cached_image(
-                    converted_image_cache,
-                    device_id,
-                    index as u8,
-                    format,
-                    image_hash,
-                    payload,
-                )
-                .await
-                {
-                    Ok(image) => image,
-                    Err(MirajazzError::BadData | MirajazzError::ImageError(_)) => continue,
-                    Err(err) => return Err(err),
-                };
+                let cache_key = converted_image_cache_key(image_hash, format);
 
-                queue_button_image_data(device, index as u8, image_data.as_slice()).await?;
-
-                last_image_hashes[index] = Some(image_hash);
-                writes_to_device += 1;
+                if let Some(cached) = converted_image_cache.get(&cache_key) {
+                    // Cache hit — resolve immediately
+                    resolved_images.push(PendingImage {
+                        index,
+                        image_hash,
+                        image_data: cached.clone(),
+                    });
+                } else {
+                    // Cache miss — launch decode+convert in parallel
+                    let dev_id = device_id.to_string();
+                    decode_tasks.spawn(async move {
+                        let data = decode_and_convert_button_image(
+                            &dev_id,
+                            index as u8,
+                            format,
+                            payload,
+                        )
+                        .await
+                        .map_err(|e| (index, e))?;
+                        Ok(PendingImage {
+                            index,
+                            image_hash,
+                            image_data: Arc::new(data),
+                        })
+                    });
+                }
             }
             None => {}
         }
+    }
+
+    // Wait for all parallel decode tasks to complete
+    while let Some(result) = decode_tasks.join_next().await {
+        match result {
+            Ok(Ok(pending)) => {
+                // Insert into cache
+                let format = button_formats[pending.index];
+                let cache_key = converted_image_cache_key(pending.image_hash, format);
+                if converted_image_cache.len() >= IMAGE_CACHE_LIMIT
+                    && !converted_image_cache.contains_key(&cache_key)
+                {
+                    converted_image_cache.clear();
+                }
+                converted_image_cache.insert(cache_key, pending.image_data.clone());
+                resolved_images.push(pending);
+            }
+            Ok(Err((_, MirajazzError::BadData | MirajazzError::ImageError(_)))) => {
+                // Non-fatal image error, skip this button
+            }
+            Ok(Err((_, err))) => return Err(err),
+            Err(join_err) => {
+                log::error!("Image decode task panic: {}", join_err);
+            }
+        }
+    }
+
+    // Sort resolved images by index for deterministic device write order
+    resolved_images.sort_by_key(|p| p.index);
+
+    // Phase 2: Write to device sequentially (required by USB/HID protocol)
+    for index in pending_clears {
+        queue_button_image_data(device, index as u8, black_frames[index].as_slice()).await?;
+        last_image_hashes[index] = None;
+        writes_to_device += 1;
+    }
+
+    for pending in resolved_images {
+        queue_button_image_data(device, pending.index as u8, pending.image_data.as_slice())
+            .await?;
+        last_image_hashes[pending.index] = Some(pending.image_hash);
+        writes_to_device += 1;
     }
 
     log::debug!(
