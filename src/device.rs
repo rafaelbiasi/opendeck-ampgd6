@@ -33,6 +33,7 @@ use crate::{
 const IMAGE_CACHE_LIMIT: usize = 64;
 const CLEAR_ALL_BATCH_WINDOW: Duration = Duration::from_millis(8);
 const IMAGE_BATCH_WINDOW: Duration = Duration::from_millis(1);
+const BUTTON_CORNER_RADIUS: u32 = 16;
 
 static DEVICE_RENDERERS: LazyLock<Mutex<HashMap<String, Arc<DeviceRenderHandle>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -384,8 +385,57 @@ fn normalize_button_image(image: DynamicImage, width: u32, height: u32) -> Dynam
     let y = (height.saturating_sub(resized.height())) / 2;
 
     let _ = canvas.copy_from(&resized, x, y);
+    apply_rounded_corners(&mut canvas, BUTTON_CORNER_RADIUS);
 
     DynamicImage::ImageRgb8(canvas)
+}
+
+fn apply_rounded_corners(image: &mut RgbImage, radius: u32) {
+    let width = image.width();
+    let height = image.height();
+    let radius = radius.min(width / 2).min(height / 2);
+
+    if radius == 0 {
+        return;
+    }
+
+    let black = Rgb([0, 0, 0]);
+
+    for y in 0..height {
+        for x in 0..width {
+            if pixel_is_outside_rounded_rect(x, y, width, height, radius) {
+                *image.get_pixel_mut(x, y) = black;
+            }
+        }
+    }
+}
+
+fn pixel_is_outside_rounded_rect(x: u32, y: u32, width: u32, height: u32, radius: u32) -> bool {
+    let right_start = width - radius;
+    let bottom_start = height - radius;
+    let radius_edge = u64::from(radius.saturating_sub(1));
+    let radius_squared = u64::from(radius) * u64::from(radius);
+
+    let dx = if x < radius {
+        Some(radius_edge - u64::from(x))
+    } else if x >= right_start {
+        Some(u64::from(x - right_start))
+    } else {
+        None
+    };
+
+    let dy = if y < radius {
+        Some(radius_edge - u64::from(y))
+    } else if y >= bottom_start {
+        Some(u64::from(y - bottom_start))
+    } else {
+        None
+    };
+
+    match (dx, dy) {
+        (Some(dx), Some(dy)) => dx * dx + dy * dy >= radius_squared,
+        _ => false,
+    }
 }
 
 fn blank_button_image(width: u32, height: u32) -> DynamicImage {
@@ -1004,15 +1054,16 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
 mod tests {
     use std::time::Duration;
 
+    use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb};
     use mirajazz::types::{ImageMirroring, ImageMode, ImageRotation};
 
     use crate::mappings::{KEY_COUNT, Kind};
 
     use super::{
-        BatchedRenderOp, CLEAR_ALL_BATCH_WINDOW, IMAGE_BATCH_WINDOW, RenderCommand,
-        apply_render_command_to_batch, batch_contains_image_updates, build_render_assets,
-        converted_image_cache_key, empty_render_batch, follow_up_batch_window, should_apply_clear,
-        should_apply_image,
+        BatchedRenderOp, BUTTON_CORNER_RADIUS, CLEAR_ALL_BATCH_WINDOW, IMAGE_BATCH_WINDOW,
+        RenderCommand, apply_render_command_to_batch, batch_contains_image_updates,
+        build_render_assets, converted_image_cache_key, empty_render_batch,
+        follow_up_batch_window, normalize_button_image, should_apply_clear, should_apply_image,
     };
 
     #[test]
@@ -1155,6 +1206,40 @@ mod tests {
         assert_ne!(
             converted_image_cache_key(7, jpeg),
             converted_image_cache_key(7, bmp)
+        );
+    }
+
+    #[test]
+    fn normalized_image_keeps_requested_dimensions() {
+        let source = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(100, 100, Rgb([255, 255, 255])));
+
+        let normalized = normalize_button_image(source, 100, 100);
+
+        assert_eq!(normalized.dimensions(), (100, 100));
+    }
+
+    #[test]
+    fn normalized_image_masks_all_four_corners_to_black() {
+        let source = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(100, 100, Rgb([255, 255, 255])));
+
+        let normalized = normalize_button_image(source, 100, 100).to_rgb8();
+
+        assert_eq!(normalized.get_pixel(0, 0), &Rgb([0, 0, 0]));
+        assert_eq!(normalized.get_pixel(99, 0), &Rgb([0, 0, 0]));
+        assert_eq!(normalized.get_pixel(0, 99), &Rgb([0, 0, 0]));
+        assert_eq!(normalized.get_pixel(99, 99), &Rgb([0, 0, 0]));
+    }
+
+    #[test]
+    fn normalized_image_preserves_center_content() {
+        let source = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(100, 100, Rgb([255, 255, 255])));
+
+        let normalized = normalize_button_image(source, 100, 100).to_rgb8();
+
+        assert_eq!(normalized.get_pixel(50, 50), &Rgb([255, 255, 255]));
+        assert_eq!(
+            normalized.get_pixel(BUTTON_CORNER_RADIUS, BUTTON_CORNER_RADIUS),
+            &Rgb([255, 255, 255])
         );
     }
 
