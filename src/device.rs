@@ -363,15 +363,13 @@ async fn input_dispatch_worker(
     mut event_rx: mpsc::UnboundedReceiver<DeviceStateUpdate>,
 ) {
     while let Some(first) = event_rx.recv().await {
-        // Drain any additional events that arrived while we were idle,
-        // so we can send them all under a single lock acquisition.
         let mut updates = vec![first];
         while let Ok(more) = event_rx.try_recv() {
             updates.push(more);
         }
 
-        if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
-            for update in updates {
+        for update in updates {
+            if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
                 dispatch_single_update(outbound, &device_id, update).await;
             }
         }
