@@ -60,11 +60,21 @@ pub fn apply_input_event(state_bitmask: &mut u16, event: D6InputEvent) -> Vec<De
             let bit = 1u16 << key;
             let was_pressed = (*state_bitmask & bit) != 0;
 
-            if pressed == was_pressed {
-                return Vec::new();
-            }
-
-            if pressed {
+            if pressed && was_pressed {
+                // Button already pressed — the release report was likely lost.
+                // Synthesize a release before re-pressing so the action fires.
+                log::debug!(
+                    "Button {} already pressed, synthesizing release before re-press",
+                    key
+                );
+                vec![
+                    DeviceStateUpdate::ButtonUp(key),
+                    DeviceStateUpdate::ButtonDown(key),
+                ]
+            } else if !pressed && !was_pressed {
+                // Already released — ignore duplicate release
+                Vec::new()
+            } else if pressed {
                 *state_bitmask |= bit;
                 vec![DeviceStateUpdate::ButtonDown(key)]
             } else {
@@ -109,8 +119,8 @@ mod tests {
     use mirajazz::state::DeviceStateUpdate;
 
     use super::{
-        D6InputEvent, apply_input_event, decode_input_report, device_to_opendeck,
-        opendeck_to_device,
+        apply_input_event, decode_input_report, device_to_opendeck, opendeck_to_device,
+        D6InputEvent,
     };
 
     #[test]
@@ -163,26 +173,95 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_state_does_not_emit_repeat() {
+    fn duplicate_press_synthesizes_release_and_repress() {
         let mut state = 0;
+        let press = D6InputEvent::Button {
+            key: 4,
+            pressed: true,
+        };
 
-        let first = apply_input_event(
-            &mut state,
-            D6InputEvent::Button {
-                key: 4,
-                pressed: true,
-            },
-        );
-        let second = apply_input_event(
-            &mut state,
-            D6InputEvent::Button {
-                key: 4,
-                pressed: true,
-            },
-        );
-
+        let first = apply_input_event(&mut state, press);
         assert_eq!(first.len(), 1);
         assert!(matches!(first[0], DeviceStateUpdate::ButtonDown(4)));
-        assert!(second.is_empty());
+        assert_eq!(
+            state,
+            1 << 4,
+            "state should have bit 4 set after first press"
+        );
+
+        let second = apply_input_event(&mut state, press);
+        assert_eq!(second.len(), 2);
+        assert!(matches!(second[0], DeviceStateUpdate::ButtonUp(4)));
+        assert!(matches!(second[1], DeviceStateUpdate::ButtonDown(4)));
+        assert_eq!(
+            state,
+            1 << 4,
+            "state should still have bit 4 set after duplicate press (auto-recovery)"
+        );
+    }
+
+    #[test]
+    fn duplicate_release_is_ignored() {
+        let mut state = 0;
+        let release = D6InputEvent::Button {
+            key: 4,
+            pressed: false,
+        };
+
+        let result = apply_input_event(&mut state, release);
+        assert!(result.is_empty());
+        assert_eq!(state, 0, "state should remain 0 after duplicate release");
+    }
+
+    #[test]
+    fn state_evolution_through_press_release_cycle() {
+        let mut state = 0;
+        let key = 3;
+        let bit = 1 << key;
+
+        // First press
+        let press1 = apply_input_event(&mut state, D6InputEvent::Button { key, pressed: true });
+        assert_eq!(press1.len(), 1);
+        assert!(matches!(press1[0], DeviceStateUpdate::ButtonDown(3)));
+        assert_eq!(state, bit);
+
+        // Duplicate press (auto-recovery)
+        let press2 = apply_input_event(&mut state, D6InputEvent::Button { key, pressed: true });
+        assert_eq!(press2.len(), 2);
+        assert!(matches!(press2[0], DeviceStateUpdate::ButtonUp(3)));
+        assert!(matches!(press2[1], DeviceStateUpdate::ButtonDown(3)));
+        assert_eq!(
+            state, bit,
+            "state should remain unchanged during auto-recovery"
+        );
+
+        // Release
+        let release1 = apply_input_event(
+            &mut state,
+            D6InputEvent::Button {
+                key,
+                pressed: false,
+            },
+        );
+        assert_eq!(release1.len(), 1);
+        assert!(matches!(release1[0], DeviceStateUpdate::ButtonUp(3)));
+        assert_eq!(state, 0);
+
+        // Duplicate release (ignored)
+        let release2 = apply_input_event(
+            &mut state,
+            D6InputEvent::Button {
+                key,
+                pressed: false,
+            },
+        );
+        assert!(release2.is_empty());
+        assert_eq!(state, 0);
+
+        // Press again after full cycle
+        let press3 = apply_input_event(&mut state, D6InputEvent::Button { key, pressed: true });
+        assert_eq!(press3.len(), 1);
+        assert!(matches!(press3[0], DeviceStateUpdate::ButtonDown(3)));
+        assert_eq!(state, bit);
     }
 }
