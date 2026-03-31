@@ -201,10 +201,10 @@ pub async fn handle_error(id: &String, err: MirajazzError) -> bool {
     }
 
     log::info!("Deregistering device {}", id);
-    if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
-        if let Err(err) = outbound.deregister_device(id.clone()).await {
-            log::warn!("Failed to deregister device {}: {}", id, err);
-        }
+    if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut()
+        && let Err(err) = outbound.deregister_device(id.clone()).await
+    {
+        log::warn!("Failed to deregister device {}: {}", id, err);
     }
 
     cleanup_device_state(id).await;
@@ -800,6 +800,7 @@ async fn process_render_batch(
                     .await?;
                 last_image_hashes[index] = None;
                 writes_to_device += 1;
+                tokio::task::yield_now().await;
             }
         } else {
             clear_all_button_images_with_assets(device, device_id, black_frames).await?;
@@ -903,6 +904,7 @@ async fn process_render_batch(
         queue_button_image_data(device, index as u8, black_frames[index].as_slice()).await?;
         last_image_hashes[index] = None;
         writes_to_device += 1;
+        tokio::task::yield_now().await;
     }
 
     for pending in resolved_images {
@@ -910,6 +912,7 @@ async fn process_render_batch(
             .await?;
         last_image_hashes[pending.index] = Some(pending.image_hash);
         writes_to_device += 1;
+        tokio::task::yield_now().await;
     }
 
     log::debug!(
@@ -975,11 +978,11 @@ async fn render_worker(
         }
 
         while let Ok(command) = command_rx.try_recv() {
-            if let Err(err) = apply_render_command_to_batch(&mut batch, &mut clear_all, command) {
-                if !handle_error(&device_id, err).await {
-                    remove_renderer_handle(&device_id, &handle).await;
-                    return;
-                }
+            if let Err(err) = apply_render_command_to_batch(&mut batch, &mut clear_all, command)
+                && !handle_error(&device_id, err).await
+            {
+                remove_renderer_handle(&device_id, &handle).await;
+                return;
             }
         }
 
@@ -1006,11 +1009,14 @@ async fn render_worker(
             batch,
         )
         .await
+            && !handle_error(&device_id, err).await
         {
-            if !handle_error(&device_id, err).await {
-                break;
-            }
+            break;
         }
+
+        // Yield to let the input reader task process any pending HID reports
+        // that arrived while the device was busy with image writes.
+        tokio::task::yield_now().await;
     }
 
     remove_renderer_handle(&device_id, &handle).await;
