@@ -97,17 +97,27 @@ pub async fn watcher_task(token: CancellationToken) -> Result<(), MirajazzError>
             match ev {
                 DeviceLifecycleEvent::Connected(info) => {
                     if let Some(candidate) = device_info_to_candidate(info) {
-                        // Don't add existing device again
-                        if DEVICES.read().await.contains_key(&candidate.id) {
-                            continue;
+                        // Atomically check+insert under a single write lock
+                        // to prevent a race where two Connected events for the
+                        // same device_id both pass the check.
+                        {
+                            let devices = DEVICES.read().await;
+                            if devices.contains_key(&candidate.id) {
+                                continue;
+                            }
                         }
 
                         let token = CancellationToken::new();
 
-                        TOKENS
-                            .write()
-                            .await
-                            .insert(candidate.id.clone(), token.clone());
+                        // Use a single write lock for TOKENS to insert atomically
+                        {
+                            let mut tokens = TOKENS.write().await;
+                            if tokens.contains_key(&candidate.id) {
+                                // Another task already claimed this device
+                                continue;
+                            }
+                            tokens.insert(candidate.id.clone(), token.clone());
+                        }
 
                         log::debug!("Spawning task for new device: {:?}", candidate);
                         tracker.spawn(device_task(candidate, token));

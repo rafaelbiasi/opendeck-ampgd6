@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     sync::{Arc, LazyLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::{Mutex, mpsc},
@@ -34,6 +34,10 @@ const IMAGE_CACHE_LIMIT: usize = 64;
 const CLEAR_ALL_BATCH_WINDOW: Duration = Duration::from_millis(8);
 const IMAGE_BATCH_WINDOW: Duration = Duration::from_millis(1);
 const BUTTON_CORNER_RADIUS: u32 = 16;
+const STUCK_BUTTON_TIMEOUT: Duration = Duration::from_secs(8);
+const HID_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const LARGE_BATCH_WRITE_DELAY: Duration = Duration::from_millis(1);
+const LARGE_BATCH_THRESHOLD: usize = 5;
 
 static DEVICE_RENDERERS: LazyLock<Mutex<HashMap<String, Arc<DeviceRenderHandle>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -201,10 +205,10 @@ pub async fn handle_error(id: &String, err: MirajazzError) -> bool {
     }
 
     log::info!("Deregistering device {}", id);
-    if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut()
-        && let Err(err) = outbound.deregister_device(id.clone()).await
-    {
-        log::warn!("Failed to deregister device {}: {}", id, err);
+    if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
+        if let Err(err) = outbound.deregister_device(id.clone()).await {
+            log::warn!("Failed to deregister device {}: {}", id, err);
+        }
     }
 
     cleanup_device_state(id).await;
@@ -269,17 +273,35 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     );
 
     let mut pressed_buttons = 0u16;
+    let mut pressed_since: [Option<Instant>; KEY_COUNT] = [None; KEY_COUNT];
 
     loop {
         log::debug!("Reading updates...");
 
-        let report = match reader.raw_read_data(512).await {
-            Ok(report) => report,
-            Err(e) => {
+        let report = match tokio::time::timeout(HID_READ_TIMEOUT, reader.raw_read_data(512)).await
+        {
+            Ok(Ok(report)) => report,
+            Ok(Err(e)) => {
+                // HID read error — release all pressed buttons to avoid stuck state
+                release_all_pressed(
+                    &mut pressed_buttons,
+                    &mut pressed_since,
+                    &event_tx,
+                    "hid_read_error",
+                );
                 if !handle_error(&candidate.id, e).await {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            Err(_timeout) => {
+                // No data within timeout — check for stuck buttons
+                check_stuck_buttons(
+                    &mut pressed_buttons,
+                    &mut pressed_since,
+                    &event_tx,
+                );
                 continue;
             }
         };
@@ -295,6 +317,19 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
             }
         };
 
+        // Update pressed_since timestamps based on state changes
+        for update in &updates {
+            match update {
+                DeviceStateUpdate::ButtonDown(key) => {
+                    pressed_since[*key as usize] = Some(Instant::now());
+                }
+                DeviceStateUpdate::ButtonUp(key) => {
+                    pressed_since[*key as usize] = None;
+                }
+                _ => {}
+            }
+        }
+
         for update in updates {
             if event_tx.send(update).is_err() {
                 return Ok(());
@@ -303,6 +338,58 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     }
 
     Ok(())
+}
+
+/// Releases all currently pressed buttons and sends ButtonUp events.
+/// Used on HID read errors and during shutdown to prevent stuck buttons.
+fn release_all_pressed(
+    pressed_buttons: &mut u16,
+    pressed_since: &mut [Option<Instant>; KEY_COUNT],
+    event_tx: &mpsc::UnboundedSender<DeviceStateUpdate>,
+    reason: &str,
+) {
+    if *pressed_buttons == 0 {
+        return;
+    }
+    log::warn!(
+        "Releasing all pressed buttons (reason: {}, mask: {:#06x})",
+        reason,
+        *pressed_buttons
+    );
+    for key in 0..KEY_COUNT {
+        if (*pressed_buttons & (1 << key)) != 0 {
+            let _ = event_tx.send(DeviceStateUpdate::ButtonUp(key as u8));
+        }
+    }
+    *pressed_buttons = 0;
+    pressed_since.fill(None);
+}
+
+/// Checks for buttons that have been pressed longer than STUCK_BUTTON_TIMEOUT
+/// and synthesizes release events for them.
+fn check_stuck_buttons(
+    pressed_buttons: &mut u16,
+    pressed_since: &mut [Option<Instant>; KEY_COUNT],
+    event_tx: &mpsc::UnboundedSender<DeviceStateUpdate>,
+) {
+    if *pressed_buttons == 0 {
+        return;
+    }
+    let now = Instant::now();
+    for (key, slot) in pressed_since.iter_mut().enumerate() {
+        if let Some(since) = *slot {
+            if now.duration_since(since) >= STUCK_BUTTON_TIMEOUT {
+                log::warn!(
+                    "Button {} stuck for {:?}, synthesizing release",
+                    key,
+                    now.duration_since(since)
+                );
+                *pressed_buttons &= !(1u16 << key);
+                *slot = None;
+                let _ = event_tx.send(DeviceStateUpdate::ButtonUp(key as u8));
+            }
+        }
+    }
 }
 
 async fn dispatch_single_update(
@@ -368,8 +455,8 @@ async fn input_dispatch_worker(
             updates.push(more);
         }
 
-        for update in updates {
-            if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
+        if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
+            for update in updates {
                 dispatch_single_update(outbound, &device_id, update).await;
             }
         }
@@ -899,12 +986,21 @@ async fn process_render_batch(
     // Sort resolved images by index for deterministic device write order
     resolved_images.sort_by_key(|p| p.index);
 
+    let total_pending_writes = pending_clears.len() + resolved_images.len();
+    let is_large_batch = total_pending_writes > LARGE_BATCH_THRESHOLD;
+
     // Phase 2: Write to device sequentially (required by USB/HID protocol)
+    // For large batches, add a small delay between writes to avoid starving
+    // the HID input reader and losing button reports.
     for index in pending_clears {
         queue_button_image_data(device, index as u8, black_frames[index].as_slice()).await?;
         last_image_hashes[index] = None;
         writes_to_device += 1;
-        tokio::task::yield_now().await;
+        if is_large_batch {
+            tokio::time::sleep(LARGE_BATCH_WRITE_DELAY).await;
+        } else {
+            tokio::task::yield_now().await;
+        }
     }
 
     for pending in resolved_images {
@@ -912,7 +1008,11 @@ async fn process_render_batch(
             .await?;
         last_image_hashes[pending.index] = Some(pending.image_hash);
         writes_to_device += 1;
-        tokio::task::yield_now().await;
+        if is_large_batch {
+            tokio::time::sleep(LARGE_BATCH_WRITE_DELAY).await;
+        } else {
+            tokio::task::yield_now().await;
+        }
     }
 
     log::debug!(
@@ -978,11 +1078,12 @@ async fn render_worker(
         }
 
         while let Ok(command) = command_rx.try_recv() {
-            if let Err(err) = apply_render_command_to_batch(&mut batch, &mut clear_all, command)
-                && !handle_error(&device_id, err).await
-            {
-                remove_renderer_handle(&device_id, &handle).await;
-                return;
+            #[allow(clippy::collapsible_if)]
+            if let Err(err) = apply_render_command_to_batch(&mut batch, &mut clear_all, command) {
+                if !handle_error(&device_id, err).await {
+                    remove_renderer_handle(&device_id, &handle).await;
+                    return;
+                }
             }
         }
 
@@ -1009,9 +1110,10 @@ async fn render_worker(
             batch,
         )
         .await
-            && !handle_error(&device_id, err).await
         {
-            break;
+            if !handle_error(&device_id, err).await {
+                break;
+            }
         }
 
         // Yield to let the input reader task process any pending HID reports
