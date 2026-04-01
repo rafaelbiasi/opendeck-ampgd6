@@ -1,8 +1,10 @@
+use ahash::AHasher;
 use data_url::DataUrl;
 use image::{
     DynamicImage, GenericImage, ImageBuffer, Rgb, RgbImage, imageops::FilterType,
     load_from_memory_with_format,
 };
+use lru::LruCache;
 use mirajazz::{
     device::Device, error::MirajazzError, images::convert_image_with_format,
     state::DeviceStateUpdate, types::ImageFormat,
@@ -10,8 +12,9 @@ use mirajazz::{
 use openaction::{OUTBOUND_EVENT_MANAGER, SetImageEvent};
 use std::{
     array,
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::HashMap,
     hash::{Hash, Hasher},
+    num::NonZeroUsize,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
@@ -38,6 +41,8 @@ const STUCK_BUTTON_TIMEOUT: Duration = Duration::from_secs(8);
 const HID_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const LARGE_BATCH_WRITE_DELAY: Duration = Duration::from_millis(1);
 const LARGE_BATCH_THRESHOLD: usize = 5;
+const RENDER_CHANNEL_CAPACITY: usize = 64;
+const USB_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 static DEVICE_RENDERERS: LazyLock<Mutex<HashMap<String, Arc<DeviceRenderHandle>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -47,7 +52,7 @@ enum RenderCommand {
     SetImage {
         position: u8,
         image_hash: u64,
-        payload: String,
+        payload: Arc<str>,
     },
     ClearButton {
         position: u8,
@@ -58,11 +63,11 @@ enum RenderCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BatchedRenderOp {
     Clear,
-    Image { image_hash: u64, payload: String },
+    Image { image_hash: u64, payload: Arc<str> },
 }
 
 struct DeviceRenderHandle {
-    command_tx: mpsc::UnboundedSender<RenderCommand>,
+    command_tx: mpsc::Sender<RenderCommand>,
     shutdown_token: CancellationToken,
 }
 
@@ -261,8 +266,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     };
 
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let tracker = TRACKER.lock().await.clone();
-    tracker.spawn(input_dispatch_worker(candidate.id.clone(), event_rx));
+    TRACKER.spawn(input_dispatch_worker(candidate.id.clone(), event_rx));
 
     log::info!("Connected to {} for incoming events", candidate.id);
     log::info!(
@@ -486,10 +490,19 @@ fn apply_rounded_corners(image: &mut RgbImage, radius: u32) {
 
     let black = Rgb([0, 0, 0]);
 
-    for y in 0..height {
-        for x in 0..width {
-            if pixel_is_outside_rounded_rect(x, y, width, height, radius) {
-                *image.get_pixel_mut(x, y) = black;
+    // Only iterate the 4 corner regions — edge and center pixels are always inside.
+    let corners: [(u32, u32, u32, u32); 4] = [
+        (0, 0, radius, radius),
+        (width - radius, 0, width, radius),
+        (0, height - radius, radius, height),
+        (width - radius, height - radius, width, height),
+    ];
+    for (x0, y0, x1, y1) in corners {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if pixel_is_outside_rounded_rect(x, y, width, height, radius) {
+                    *image.get_pixel_mut(x, y) = black;
+                }
             }
         }
     }
@@ -533,9 +546,18 @@ async fn queue_button_image_data(
     position: u8,
     image_data: &[u8],
 ) -> Result<(), MirajazzError> {
-    device
-        .write_image(opendeck_to_device(position), image_data)
-        .await
+    match tokio::time::timeout(
+        USB_WRITE_TIMEOUT,
+        device.write_image(opendeck_to_device(position), image_data),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            log::error!("USB write timed out at position {}", position);
+            Err(MirajazzError::InvalidDeviceError)
+        }
+    }
 }
 
 fn resolve_device_kind(device: &Device, device_id: &str) -> Result<Kind, MirajazzError> {
@@ -551,7 +573,7 @@ fn resolve_device_kind(device: &Device, device_id: &str) -> Result<Kind, Mirajaz
 }
 
 fn hash_image_payload(image: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = AHasher::default();
     image.hash(&mut hasher);
     hasher.finish()
 }
@@ -658,7 +680,7 @@ async fn decode_and_convert_button_image(
     device_id: &str,
     position: u8,
     format: ImageFormat,
-    payload: String,
+    payload: Arc<str>,
 ) -> Result<Vec<u8>, MirajazzError> {
     let worker_device_id = device_id.to_string();
     let join_device_id = worker_device_id.clone();
@@ -813,37 +835,29 @@ async fn get_device_renderer(
     device: &Device,
     device_id: &str,
 ) -> Result<Arc<DeviceRenderHandle>, MirajazzError> {
-    {
-        let renderers = DEVICE_RENDERERS.lock().await;
-        if let Some(renderer) = renderers.get(device_id) {
-            return Ok(renderer.clone());
+    use std::collections::hash_map::Entry;
+
+    let mut renderers = DEVICE_RENDERERS.lock().await;
+    match renderers.entry(device_id.to_string()) {
+        Entry::Occupied(e) => Ok(e.get().clone()),
+        Entry::Vacant(e) => {
+            let kind = resolve_device_kind(device, device_id)?;
+            let (command_tx, command_rx) = mpsc::channel(RENDER_CHANNEL_CAPACITY);
+            let handle = Arc::new(DeviceRenderHandle {
+                command_tx,
+                shutdown_token: CancellationToken::new(),
+            });
+            e.insert(handle.clone());
+            drop(renderers);
+            TRACKER.spawn(render_worker(
+                device_id.to_string(),
+                kind,
+                handle.clone(),
+                command_rx,
+            ));
+            Ok(handle)
         }
     }
-
-    let kind = resolve_device_kind(device, device_id)?;
-    let (command_tx, command_rx) = mpsc::unbounded_channel();
-    let handle = Arc::new(DeviceRenderHandle {
-        command_tx,
-        shutdown_token: CancellationToken::new(),
-    });
-
-    {
-        let mut renderers = DEVICE_RENDERERS.lock().await;
-        if let Some(renderer) = renderers.get(device_id) {
-            return Ok(renderer.clone());
-        }
-        renderers.insert(device_id.to_string(), handle.clone());
-    }
-
-    let tracker = TRACKER.lock().await.clone();
-    tracker.spawn(render_worker(
-        device_id.to_string(),
-        kind,
-        handle.clone(),
-        command_rx,
-    ));
-
-    Ok(handle)
 }
 
 async fn enqueue_render_command(
@@ -853,22 +867,32 @@ async fn enqueue_render_command(
 ) -> Result<(), MirajazzError> {
     for _ in 0..2 {
         let renderer = get_device_renderer(device, device_id).await?;
-        if renderer.command_tx.send(command.clone()).is_ok() {
-            return Ok(());
+        match renderer.command_tx.try_send(command.clone()) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::warn!(
+                    "Render queue is full for device {}, dropping command",
+                    device_id
+                );
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                remove_renderer_handle(device_id, &renderer).await;
+            }
         }
-        remove_renderer_handle(device_id, &renderer).await;
     }
 
     log::warn!("Render queue is unavailable for device {}", device_id);
     Err(MirajazzError::BadData)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_render_batch(
     device: &Device,
     device_id: &str,
     button_formats: &[ImageFormat],
     black_frames: &[Arc<Vec<u8>>],
-    converted_image_cache: &mut HashMap<ConvertedImageCacheKey, Arc<Vec<u8>>>,
+    converted_image_cache: &mut LruCache<ConvertedImageCacheKey, Arc<Vec<u8>>>,
     last_image_hashes: &mut [Option<u64>; KEY_COUNT],
     clear_all: bool,
     batch: RenderBatch,
@@ -962,15 +986,10 @@ async fn process_render_batch(
     while let Some(result) = decode_tasks.join_next().await {
         match result {
             Ok(Ok(pending)) => {
-                // Insert into cache
+                // Insert into cache (LRU evicts the oldest entry automatically when full)
                 let format = button_formats[pending.index];
                 let cache_key = converted_image_cache_key(pending.image_hash, format);
-                if converted_image_cache.len() >= IMAGE_CACHE_LIMIT
-                    && !converted_image_cache.contains_key(&cache_key)
-                {
-                    converted_image_cache.clear();
-                }
-                converted_image_cache.insert(cache_key, pending.image_data.clone());
+                converted_image_cache.put(cache_key, pending.image_data.clone());
                 resolved_images.push(pending);
             }
             Ok(Err((_, MirajazzError::BadData | MirajazzError::ImageError(_)))) => {
@@ -1024,7 +1043,13 @@ async fn process_render_batch(
     );
 
     if writes_to_device > 0 {
-        device.flush().await?;
+        match tokio::time::timeout(USB_WRITE_TIMEOUT, device.flush()).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                log::error!("USB flush timed out for device {}", device_id);
+                return Err(MirajazzError::InvalidDeviceError);
+            }
+        }
     }
 
     Ok(())
@@ -1034,7 +1059,7 @@ async fn render_worker(
     device_id: String,
     kind: Kind,
     handle: Arc<DeviceRenderHandle>,
-    mut command_rx: mpsc::UnboundedReceiver<RenderCommand>,
+    mut command_rx: mpsc::Receiver<RenderCommand>,
 ) {
     let (button_formats, black_frames) = match build_render_assets(&kind).await {
         Ok(assets) => assets,
@@ -1044,7 +1069,8 @@ async fn render_worker(
             return;
         }
     };
-    let mut converted_image_cache = HashMap::new();
+    let mut converted_image_cache =
+        LruCache::new(NonZeroUsize::new(IMAGE_CACHE_LIMIT).expect("cache limit must be non-zero"));
     let mut last_image_hashes = [None; KEY_COUNT];
 
     loop {
@@ -1099,7 +1125,7 @@ async fn render_worker(
             batch_contains_image_updates(&batch)
         );
 
-        if let Err(err) = process_render_batch(
+        let result = process_render_batch(
             device.as_ref(),
             &device_id,
             &button_formats,
@@ -1109,8 +1135,9 @@ async fn render_worker(
             clear_all,
             batch,
         )
-        .await
-        {
+        .await;
+        
+        if let Err(err) = result {
             if !handle_error(&device_id, err).await {
                 break;
             }
@@ -1136,8 +1163,8 @@ pub async fn handle_set_image(device: &Device, evt: SetImageEvent) -> Result<(),
                 &device_id,
                 RenderCommand::SetImage {
                     position,
-                    image_hash: hash_image_payload(image.as_str()),
-                    payload: image,
+                    image_hash: hash_image_payload(&image),
+                    payload: Arc::from(image),
                 },
             )
             .await?;
@@ -1203,7 +1230,7 @@ mod tests {
             RenderCommand::SetImage {
                 position: 2,
                 image_hash: 10,
-                payload: "a".to_string(),
+                payload: "a".into(),
             },
         )
         .unwrap();
@@ -1229,7 +1256,7 @@ mod tests {
             RenderCommand::SetImage {
                 position: 1,
                 image_hash: 10,
-                payload: "a".to_string(),
+                payload: "a".into(),
             },
         )
         .unwrap();
@@ -1251,7 +1278,7 @@ mod tests {
             RenderCommand::SetImage {
                 position: 4,
                 image_hash: 99,
-                payload: "b".to_string(),
+                payload: "b".into(),
             },
         )
         .unwrap();
@@ -1261,7 +1288,7 @@ mod tests {
             batch[4],
             Some(BatchedRenderOp::Image {
                 image_hash: 99,
-                payload: "b".to_string(),
+                payload: "b".into(),
             })
         );
     }
@@ -1280,7 +1307,7 @@ mod tests {
             follow_up_batch_window(&RenderCommand::SetImage {
                 position: 0,
                 image_hash: 1,
-                payload: "a".to_string(),
+                payload: "a".into(),
             }),
             Some(IMAGE_BATCH_WINDOW)
         );
@@ -1370,7 +1397,7 @@ mod tests {
             RenderCommand::SetImage {
                 position: 3,
                 image_hash: 55,
-                payload: "x".to_string(),
+                payload: "x".into(),
             },
         )
         .unwrap();

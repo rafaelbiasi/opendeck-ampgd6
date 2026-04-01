@@ -5,6 +5,7 @@ use mirajazz::{
     types::{DeviceLifecycleEvent, HidDeviceInfo},
 };
 use openaction::OUTBOUND_EVENT_MANAGER;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -60,10 +61,39 @@ async fn get_candidates() -> Result<Vec<CandidateDevice>, MirajazzError> {
 }
 
 pub async fn watcher_task(token: CancellationToken) -> Result<(), MirajazzError> {
-    let tracker = TRACKER.lock().await.clone();
-
-    // Scans for connected devices that (possibly) we can use
-    let candidates = get_candidates().await?;
+    // Retry initial scan with exponential backoff in case the HID subsystem
+    // is not yet available (e.g. plugin starts before udev settles).
+    let candidates = {
+        let mut delay = Duration::from_secs(1);
+        let mut last_err = MirajazzError::DeviceNotFoundError;
+        let mut found = None;
+        for attempt in 1..=3 {
+            match get_candidates().await {
+                Ok(c) => {
+                    found = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to scan for candidate devices (attempt {}/3): {}. Retrying in {:?}...",
+                        attempt,
+                        e,
+                        delay
+                    );
+                    last_err = e;
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {},
+                        _ = token.cancelled() => return Ok(()),
+                    }
+                    delay *= 2;
+                }
+            }
+        }
+        match found {
+            Some(c) => c,
+            None => return Err(last_err),
+        }
+    };
 
     log::info!("Looking for connected devices");
 
@@ -77,7 +107,7 @@ pub async fn watcher_task(token: CancellationToken) -> Result<(), MirajazzError>
             .await
             .insert(candidate.id.clone(), token.clone());
 
-        tracker.spawn(device_task(candidate, token));
+        TRACKER.spawn(device_task(candidate, token));
     }
 
     let mut watcher = DeviceWatcher::new();
@@ -120,7 +150,7 @@ pub async fn watcher_task(token: CancellationToken) -> Result<(), MirajazzError>
                         }
 
                         log::debug!("Spawning task for new device: {:?}", candidate);
-                        tracker.spawn(device_task(candidate, token));
+                        TRACKER.spawn(device_task(candidate, token));
                         log::debug!("Spawned");
                     }
                 }

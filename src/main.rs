@@ -2,7 +2,7 @@ use device::{handle_error, handle_set_image};
 use mirajazz::device::Device;
 use openaction::*;
 use std::{collections::HashMap, sync::Arc, sync::LazyLock};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use watcher::watcher_task;
 
@@ -18,7 +18,7 @@ pub static DEVICES: LazyLock<RwLock<HashMap<String, Arc<Device>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 pub static TOKENS: LazyLock<RwLock<HashMap<String, CancellationToken>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
-pub static TRACKER: LazyLock<Mutex<TaskTracker>> = LazyLock::new(|| Mutex::new(TaskTracker::new()));
+pub static TRACKER: LazyLock<TaskTracker> = LazyLock::new(TaskTracker::new);
 
 struct GlobalEventHandler {}
 impl openaction::GlobalEventHandler for GlobalEventHandler {
@@ -26,10 +26,8 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {
         &self,
         _outbound: &mut openaction::OutboundEventManager,
     ) -> EventHandlerResult {
-        let tracker = TRACKER.lock().await.clone();
-
         let token = CancellationToken::new();
-        tracker.spawn(watcher_task(token.clone()));
+        TRACKER.spawn(watcher_task(token.clone()));
 
         TOKENS
             .write()
@@ -146,12 +144,10 @@ async fn main() -> EventHandlerResult {
 
     shutdown().await;
 
-    let tracker = TRACKER.lock().await.clone();
-
     log::info!("Waiting for tasks to finish");
 
-    tracker.close();
-    tracker.wait().await;
+    TRACKER.close();
+    TRACKER.wait().await;
 
     log::info!("Tasks are finished, exiting now");
 
