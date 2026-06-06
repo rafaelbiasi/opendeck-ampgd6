@@ -5,26 +5,27 @@ use mirajazz::{
     types::{DeviceLifecycleEvent, HidDeviceInfo},
 };
 use openaction::OUTBOUND_EVENT_MANAGER;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     DEVICES, TOKENS, TRACKER,
-    device::device_task,
+    device::{cleanup_device_state, device_task},
     mappings::{CandidateDevice, DEVICE_NAMESPACE, Kind, QUERIES},
 };
 
 fn get_device_id(dev: &HidDeviceInfo) -> Option<String> {
     let kind = Kind::from_vid_pid(dev.vendor_id, dev.product_id)?;
 
-    match kind.protocol_version() {
+    match kind.write_protocol_version() {
         2 | 3 => Some(format!(
             "{}-{}",
             DEVICE_NAMESPACE,
             dev.serial_number.clone()?,
         )),
         1 => {
-            // All the "v1" devices share the same serial. Hardcode it because Windows returns invalid serial for them
-            // Also suffix v1 devices with the
+            // All "v1" devices share the same serial. Keep a stable synthetic ID so
+            // OpenDeck sees the same device identity across reconnects and restarts.
             Some(format!(
                 "{}-355499441494-{}",
                 DEVICE_NAMESPACE,
@@ -60,10 +61,39 @@ async fn get_candidates() -> Result<Vec<CandidateDevice>, MirajazzError> {
 }
 
 pub async fn watcher_task(token: CancellationToken) -> Result<(), MirajazzError> {
-    let tracker = TRACKER.lock().await.clone();
-
-    // Scans for connected devices that (possibly) we can use
-    let candidates = get_candidates().await?;
+    // Retry initial scan with exponential backoff in case the HID subsystem
+    // is not yet available (e.g. plugin starts before udev settles).
+    let candidates = {
+        let mut delay = Duration::from_secs(1);
+        let mut last_err = MirajazzError::DeviceNotFoundError;
+        let mut found = None;
+        for attempt in 1..=3 {
+            match get_candidates().await {
+                Ok(c) => {
+                    found = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to scan for candidate devices (attempt {}/3): {}. Retrying in {:?}...",
+                        attempt,
+                        e,
+                        delay
+                    );
+                    last_err = e;
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {},
+                        _ = token.cancelled() => return Ok(()),
+                    }
+                    delay *= 2;
+                }
+            }
+        }
+        match found {
+            Some(c) => c,
+            None => return Err(last_err),
+        }
+    };
 
     log::info!("Looking for connected devices");
 
@@ -77,7 +107,7 @@ pub async fn watcher_task(token: CancellationToken) -> Result<(), MirajazzError>
             .await
             .insert(candidate.id.clone(), token.clone());
 
-        tracker.spawn(device_task(candidate, token));
+        TRACKER.spawn(device_task(candidate, token));
     }
 
     let mut watcher = DeviceWatcher::new();
@@ -97,33 +127,44 @@ pub async fn watcher_task(token: CancellationToken) -> Result<(), MirajazzError>
             match ev {
                 DeviceLifecycleEvent::Connected(info) => {
                     if let Some(candidate) = device_info_to_candidate(info) {
-                        // Don't add existing device again
-                        if DEVICES.read().await.contains_key(&candidate.id) {
-                            continue;
+                        // Atomically check+insert under a single write lock
+                        // to prevent a race where two Connected events for the
+                        // same device_id both pass the check.
+                        {
+                            let devices = DEVICES.read().await;
+                            if devices.contains_key(&candidate.id) {
+                                continue;
+                            }
                         }
 
                         let token = CancellationToken::new();
 
-                        TOKENS
-                            .write()
-                            .await
-                            .insert(candidate.id.clone(), token.clone());
+                        // Use a single write lock for TOKENS to insert atomically
+                        {
+                            let mut tokens = TOKENS.write().await;
+                            if tokens.contains_key(&candidate.id) {
+                                // Another task already claimed this device
+                                continue;
+                            }
+                            tokens.insert(candidate.id.clone(), token.clone());
+                        }
 
                         log::debug!("Spawning task for new device: {:?}", candidate);
-                        tracker.spawn(device_task(candidate, token));
+                        TRACKER.spawn(device_task(candidate, token));
                         log::debug!("Spawned");
                     }
                 }
                 DeviceLifecycleEvent::Disconnected(info) => {
-                    let id = get_device_id(&info)
-                        .expect("Unable to get device id, check mappings in Kind::from_vid_pid");
+                    let Some(id) = get_device_id(&info) else {
+                        log::warn!(
+                            "Ignoring disconnect event for unmapped device: vid={:#06x}, pid={:#06x}",
+                            info.vendor_id,
+                            info.product_id
+                        );
+                        continue;
+                    };
 
-                    if let Some(token) = TOKENS.write().await.remove(&id) {
-                        log::info!("Sending cancel request for {}", id);
-                        token.cancel();
-                    }
-
-                    DEVICES.write().await.remove(&id);
+                    cleanup_device_state(&id).await;
 
                     if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
                         outbound.deregister_device(id.clone()).await.ok();

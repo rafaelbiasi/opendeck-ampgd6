@@ -1,8 +1,8 @@
 use device::{handle_error, handle_set_image};
 use mirajazz::device::Device;
 use openaction::*;
-use std::{collections::HashMap, process::exit, sync::LazyLock};
-use tokio::sync::{Mutex, RwLock};
+use std::{collections::HashMap, sync::Arc, sync::LazyLock};
+use tokio::sync::RwLock;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use watcher::watcher_task;
 
@@ -14,11 +14,11 @@ mod inputs;
 mod mappings;
 mod watcher;
 
-pub static DEVICES: LazyLock<RwLock<HashMap<String, Device>>> =
+pub static DEVICES: LazyLock<RwLock<HashMap<String, Arc<Device>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 pub static TOKENS: LazyLock<RwLock<HashMap<String, CancellationToken>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
-pub static TRACKER: LazyLock<Mutex<TaskTracker>> = LazyLock::new(|| Mutex::new(TaskTracker::new()));
+pub static TRACKER: LazyLock<TaskTracker> = LazyLock::new(TaskTracker::new);
 
 struct GlobalEventHandler {}
 impl openaction::GlobalEventHandler for GlobalEventHandler {
@@ -26,10 +26,8 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {
         &self,
         _outbound: &mut openaction::OutboundEventManager,
     ) -> EventHandlerResult {
-        let tracker = TRACKER.lock().await.clone();
-
         let token = CancellationToken::new();
-        tracker.spawn(watcher_task(token.clone()));
+        TRACKER.spawn(watcher_task(token.clone()));
 
         TOKENS
             .write()
@@ -56,11 +54,12 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {
 
         let id = event.device.clone();
 
-        if let Some(device) = DEVICES.read().await.get(&event.device) {
-            handle_set_image(device, event)
-                .await
-                .map_err(async |err| handle_error(&id, err).await)
-                .ok();
+        let device = DEVICES.read().await.get(&event.device).cloned();
+
+        if let Some(device) = device {
+            if let Err(err) = handle_set_image(device.as_ref(), event).await {
+                handle_error(&id, err).await;
+            }
         } else {
             log::error!("Received event for unknown device: {}", event.device);
         }
@@ -77,12 +76,12 @@ impl openaction::GlobalEventHandler for GlobalEventHandler {
 
         let id = event.device.clone();
 
-        if let Some(device) = DEVICES.read().await.get(&event.device) {
-            device
-                .set_brightness(event.brightness)
-                .await
-                .map_err(async |err| handle_error(&id, err).await)
-                .ok();
+        let device = DEVICES.read().await.get(&event.device).cloned();
+
+        if let Some(device) = device {
+            if let Err(err) = device.set_brightness(event.brightness).await {
+                handle_error(&id, err).await;
+            }
         } else {
             log::error!("Received event for unknown device: {}", event.device);
         }
@@ -102,16 +101,17 @@ async fn shutdown() {
     }
 }
 
-async fn connect() {
-    if let Err(error) = init_plugin(GlobalEventHandler {}, ActionEventHandler {}).await {
-        log::error!("Failed to initialize plugin: {}", error);
-
-        exit(1);
-    }
+async fn connect() -> EventHandlerResult {
+    init_plugin(GlobalEventHandler {}, ActionEventHandler {})
+        .await
+        .map_err(|error| {
+            log::error!("Failed to initialize plugin: {}", error);
+            error
+        })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-async fn sigterm() -> Result<(), Box<dyn std::error::Error>> {
+async fn sigterm() -> EventHandlerResult {
     let mut sig = signal(SignalKind::terminate())?;
 
     sig.recv().await;
@@ -120,41 +120,36 @@ async fn sigterm() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "windows")]
-async fn sigterm() -> Result<(), Box<dyn std::error::Error>> {
-    // Future that would never resolve, so select only acts on OpenDeck connection loss
-    // TODO: Proper windows termination handling
-    std::future::pending::<()>().await;
-
+async fn sigterm() -> EventHandlerResult {
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> EventHandlerResult {
     simplelog::TermLogger::init(
         simplelog::LevelFilter::Info,
         simplelog::Config::default(),
         simplelog::TerminalMode::Stdout,
         simplelog::ColorChoice::Never,
     )
-    .unwrap();
+    .unwrap_or_else(|err| eprintln!("Failed to initialize logger: {err}"));
 
-    tokio::select! {
-        _ = connect() => {},
-        _ = sigterm() => {},
-    }
+    let result = tokio::select! {
+        result = connect() => result,
+        result = sigterm() => result,
+    };
 
     log::info!("Shutting down");
 
     shutdown().await;
 
-    let tracker = TRACKER.lock().await.clone();
-
     log::info!("Waiting for tasks to finish");
 
-    tracker.close();
-    tracker.wait().await;
+    TRACKER.close();
+    TRACKER.wait().await;
 
     log::info!("Tasks are finished, exiting now");
 
-    Ok(())
+    result
 }

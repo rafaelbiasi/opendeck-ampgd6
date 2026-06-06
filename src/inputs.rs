@@ -1,24 +1,88 @@
-use mirajazz::{error::MirajazzError, types::DeviceInput};
+use mirajazz::{error::MirajazzError, state::DeviceStateUpdate, types::DeviceInput};
 
 use crate::mappings::KEY_COUNT;
 
-pub fn process_input(input: u8, state: u8) -> Result<DeviceInput, MirajazzError> {
-    log::debug!("Processing input: {}, {}", input, state);
+const ACK_PREFIX: [u8; 3] = [65, 67, 75];
+const MAX_DEVICE_INPUT: u8 = KEY_COUNT as u8;
+const OPENDECK_TO_DEVICE: [u8; KEY_COUNT] = [10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4];
 
-    match input as usize {
-        (0..=KEY_COUNT) => read_button_press(input, state),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum D6InputEvent {
+    Reset,
+    Button { key: u8, pressed: bool },
+}
+
+pub fn ignore_process_input(_input: u8, _state: u8) -> Result<DeviceInput, MirajazzError> {
+    Ok(DeviceInput::NoData)
+}
+
+pub fn decode_input_report(data: &[u8]) -> Result<Option<D6InputEvent>, MirajazzError> {
+    if data.len() < 11 {
+        return Ok(None);
+    }
+
+    if !data.starts_with(&ACK_PREFIX) {
+        return Ok(None);
+    }
+
+    let input = data[9];
+    let state = data[10];
+
+    log::debug!(
+        "Decoding raw input report: input={}, state={}, len={}",
+        input,
+        state,
+        data.len()
+    );
+
+    match input {
+        0 => Ok(Some(D6InputEvent::Reset)),
+        1..=MAX_DEVICE_INPUT => Ok(Some(D6InputEvent::Button {
+            key: device_to_opendeck(input as usize)? as u8,
+            pressed: state != 0,
+        })),
         _ => Err(MirajazzError::BadData),
     }
 }
 
-fn read_button_states(states: &[u8]) -> Vec<bool> {
-    let mut bools = vec![];
+pub fn apply_input_event(state_bitmask: &mut u16, event: D6InputEvent) -> Vec<DeviceStateUpdate> {
+    match event {
+        D6InputEvent::Reset => {
+            let previous = *state_bitmask;
+            *state_bitmask = 0;
 
-    for i in 0..KEY_COUNT {
-        bools.push(states[i + 1] != 0);
+            (0..KEY_COUNT)
+                .filter(|index| (previous & (1 << index)) != 0)
+                .map(|index| DeviceStateUpdate::ButtonUp(index as u8))
+                .collect()
+        }
+        D6InputEvent::Button { key, pressed } => {
+            let bit = 1u16 << key;
+            let was_pressed = (*state_bitmask & bit) != 0;
+
+            if pressed && was_pressed {
+                // Button already pressed — the release report was likely lost.
+                // Synthesize a release before re-pressing so the action fires.
+                log::debug!(
+                    "Button {} already pressed, synthesizing release before re-press",
+                    key
+                );
+                vec![
+                    DeviceStateUpdate::ButtonUp(key),
+                    DeviceStateUpdate::ButtonDown(key),
+                ]
+            } else if !pressed && !was_pressed {
+                // Already released — ignore duplicate release
+                Vec::new()
+            } else if pressed {
+                *state_bitmask |= bit;
+                vec![DeviceStateUpdate::ButtonDown(key)]
+            } else {
+                *state_bitmask &= !bit;
+                vec![DeviceStateUpdate::ButtonUp(key)]
+            }
+        }
     }
-
-    bools
 }
 
 /// Converts opendeck key index to device key index
@@ -32,9 +96,7 @@ fn read_button_states(states: &[u8]) -> Vec<bool> {
 /// This maps OpenDeck positions to device button indexes
 pub fn opendeck_to_device(key: u8) -> u8 {
     if key < KEY_COUNT as u8 {
-        // Try ss550-like mapping: [10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4]
-        // This means: OpenDeck 0 -> Device 10, OpenDeck 1 -> Device 11, etc.
-        [10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4][key as usize]
+        OPENDECK_TO_DEVICE[key as usize]
     } else {
         key
     }
@@ -42,80 +104,167 @@ pub fn opendeck_to_device(key: u8) -> u8 {
 
 /// Converts device key index to opendeck key index
 /// Device sends 1-based indexes (1-15), we convert to 0-based OpenDeck indexes (0-14)
-///
-/// User testing shows:
-/// - Image 0 -> Action 10 (when pressed) - WRONG, should be Action 0
-/// - Image 10 -> Action 0 (when pressed) - WRONG, should be Action 10
-///
-/// opendeck_to_device: [10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4]
-/// This means: Device 10 shows image 0, Device 0 shows image 10
-///
-/// For events: When pressing Device 10 (shows image 0), we want action 0 to trigger
-/// When pressing Device 0 (shows image 10), we want action 10 to trigger
-///
-/// So: device_to_opendeck(10) should return 0, device_to_opendeck(0) should return 10
-///
-/// The correct inverse mapping: find where each device index appears in opendeck_to_device
-/// Device 0 appears at position 10 -> should return 10 (but we want 0 for image 0...)
-/// Wait, that's confusing. Let me think:
-///
-/// If Device 10 shows image 0, and we want pressing Device 10 to trigger action 0,
-/// then device_to_opendeck(10) must return 0.
-///
-/// The inverse of [10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4] is:
-/// Device 0 -> OpenDeck 10, Device 1 -> OpenDeck 11, ..., Device 10 -> OpenDeck 0, Device 11 -> OpenDeck 1, ...
-/// Which is: [10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4]
-///
-/// But that's what we had and it gave wrong results. The issue might be that the device
-/// sends a different index than what we use for images. Let's create a mapping based on the actual behavior.
-pub fn device_to_opendeck(key: usize) -> usize {
-    // Try the ss550 approach: simple linear mapping
-    // The device sends 1-based indexes (1-15), we convert to 0-based (0-14)
-    // For ss550, this works because the device sends linear indexes for events
-    // even though images use a mapped layout
-    let result = key - 1;
-    log::info!(
-        "device_to_opendeck: device_index_1based={}, opendeck_index={}",
-        key,
-        result
-    );
-    result
-}
-
-fn read_button_press(input: u8, state: u8) -> Result<DeviceInput, MirajazzError> {
-    let mut button_states = vec![0x01];
-    button_states.extend(vec![0u8; KEY_COUNT + 1]);
-
-    if input == 0 {
-        return Ok(DeviceInput::ButtonStateChange(read_button_states(
-            &button_states,
-        )));
+pub fn device_to_opendeck(key: usize) -> Result<usize, MirajazzError> {
+if !(1..=KEY_COUNT).contains(&key) {
+        log::warn!(
+"Button index {} out of range in device_to_opendeck (expected 1..={})",
+            key,
+            KEY_COUNT
+        );
+        return Err(MirajazzError::BadData);
     }
 
-    let pressed_index: usize = device_to_opendeck(input as usize);
-    // AMPGD6 reports state as: 1 = key down, 0 = key up
-    let is_pressed = state != 0;
-    log::info!(
-        "Button event: device_index={}, opendeck_index={}, raw_state={}, is_pressed={}",
-        input,
-        pressed_index,
-        state,
-        is_pressed
-    );
+    Ok(key - 1)
+}
 
-    // `device_to_opendeck` is 0-based, so add 1
-    // I'll probably have to refactor all of this off-by-one stuff in this file, but that's a future me problem
-    if pressed_index < KEY_COUNT {
-        button_states[pressed_index + 1] = if is_pressed { 1 } else { 0 };
-    } else {
-        log::warn!(
-            "Button index {} out of range (max: {})",
-            pressed_index,
-            KEY_COUNT - 1
+#[cfg(test)]
+mod tests {
+    use mirajazz::state::DeviceStateUpdate;
+
+    use super::{
+        apply_input_event, decode_input_report, device_to_opendeck, opendeck_to_device,
+        D6InputEvent,
+    };
+
+    #[test]
+    fn image_mapping_matches_expected_layout() {
+        let expected = [10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4];
+
+        for (opendeck, device) in expected.into_iter().enumerate() {
+            assert_eq!(opendeck_to_device(opendeck as u8), device);
+        }
+    }
+
+    #[test]
+    fn event_mapping_is_linear_one_based() {
+        for device_index in 1..=15 {
+            assert_eq!(device_to_opendeck(device_index).unwrap(), device_index - 1);
+        }
+    }
+
+    #[test]
+    fn decode_ack_button_report() {
+        let mut data = vec![0u8; 11];
+        data[..3].copy_from_slice(b"ACK");
+        data[9] = 3;
+        data[10] = 1;
+
+        assert_eq!(
+            decode_input_report(&data).unwrap(),
+            Some(D6InputEvent::Button {
+                key: 2,
+                pressed: true,
+            })
         );
     }
 
-    Ok(DeviceInput::ButtonStateChange(read_button_states(
-        &button_states,
-    )))
+    #[test]
+    fn ignore_non_ack_report() {
+        let data = vec![0u8; 11];
+        assert!(decode_input_report(&data).unwrap().is_none());
+    }
+
+    #[test]
+    fn reset_releases_pressed_buttons() {
+        let mut state = 0b101;
+        let updates = apply_input_event(&mut state, D6InputEvent::Reset);
+
+        assert_eq!(state, 0);
+        assert_eq!(updates.len(), 2);
+        assert!(matches!(updates[0], DeviceStateUpdate::ButtonUp(0)));
+        assert!(matches!(updates[1], DeviceStateUpdate::ButtonUp(2)));
+    }
+
+    #[test]
+    fn duplicate_press_synthesizes_release_and_repress() {
+        let mut state = 0;
+        let press = D6InputEvent::Button {
+            key: 4,
+            pressed: true,
+        };
+
+        let first = apply_input_event(&mut state, press);
+        assert_eq!(first.len(), 1);
+        assert!(matches!(first[0], DeviceStateUpdate::ButtonDown(4)));
+        assert_eq!(
+            state,
+            1 << 4,
+            "state should have bit 4 set after first press"
+        );
+
+        let second = apply_input_event(&mut state, press);
+        assert_eq!(second.len(), 2);
+        assert!(matches!(second[0], DeviceStateUpdate::ButtonUp(4)));
+        assert!(matches!(second[1], DeviceStateUpdate::ButtonDown(4)));
+        assert_eq!(
+            state,
+            1 << 4,
+            "state should still have bit 4 set after duplicate press (auto-recovery)"
+        );
+    }
+
+    #[test]
+    fn duplicate_release_is_ignored() {
+        let mut state = 0;
+        let release = D6InputEvent::Button {
+            key: 4,
+            pressed: false,
+        };
+
+        let result = apply_input_event(&mut state, release);
+        assert!(result.is_empty());
+        assert_eq!(state, 0, "state should remain 0 after duplicate release");
+    }
+
+    #[test]
+    fn state_evolution_through_press_release_cycle() {
+        let mut state = 0;
+        let key = 3;
+        let bit = 1 << key;
+
+        // First press
+        let press1 = apply_input_event(&mut state, D6InputEvent::Button { key, pressed: true });
+        assert_eq!(press1.len(), 1);
+        assert!(matches!(press1[0], DeviceStateUpdate::ButtonDown(3)));
+        assert_eq!(state, bit);
+
+        // Duplicate press (auto-recovery)
+        let press2 = apply_input_event(&mut state, D6InputEvent::Button { key, pressed: true });
+        assert_eq!(press2.len(), 2);
+        assert!(matches!(press2[0], DeviceStateUpdate::ButtonUp(3)));
+        assert!(matches!(press2[1], DeviceStateUpdate::ButtonDown(3)));
+        assert_eq!(
+            state, bit,
+            "state should remain unchanged during auto-recovery"
+        );
+
+        // Release
+        let release1 = apply_input_event(
+            &mut state,
+            D6InputEvent::Button {
+                key,
+                pressed: false,
+            },
+        );
+        assert_eq!(release1.len(), 1);
+        assert!(matches!(release1[0], DeviceStateUpdate::ButtonUp(3)));
+        assert_eq!(state, 0);
+
+        // Duplicate release (ignored)
+        let release2 = apply_input_event(
+            &mut state,
+            D6InputEvent::Button {
+                key,
+                pressed: false,
+            },
+        );
+        assert!(release2.is_empty());
+        assert_eq!(state, 0);
+
+        // Press again after full cycle
+        let press3 = apply_input_event(&mut state, D6InputEvent::Button { key, pressed: true });
+        assert_eq!(press3.len(), 1);
+        assert!(matches!(press3[0], DeviceStateUpdate::ButtonDown(3)));
+        assert_eq!(state, bit);
+    }
 }

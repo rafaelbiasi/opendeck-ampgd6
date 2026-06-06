@@ -23,26 +23,7 @@ pub const AMPGD6_PID: u16 = 0x0007;
 // Map all queries to usage page 65440 and usage id 1 for now
 pub const AMPGD6_QUERY: DeviceQuery = DeviceQuery::new(65440, 1, FIFINE_VID, AMPGD6_PID);
 
-pub const QUERIES: [DeviceQuery; 1] = [
-    AMPGD6_QUERY,
-];
-
-/// Returns correct image format for device kind and key
-pub fn get_image_format_for_key(kind: &Kind, _key: u8) -> ImageFormat {
-    // AMPGD6 doesn't need rotation or mirroring - images are displayed normally
-    let size = if kind.protocol_version() == 1 {
-        (105, 105)
-    } else {
-        (105, 105)
-    };
-
-    ImageFormat {
-        mode: ImageMode::JPEG,
-        size,
-        rotation: ImageRotation::Rot180, // AMPGD6 needs 180° rotation
-        mirror: ImageMirroring::None,  // No mirroring needed for AMPGD6
-    }
-}
+pub const QUERIES: [DeviceQuery; 1] = [AMPGD6_QUERY];
 
 impl Kind {
     /// Matches devices VID+PID pairs to correct kinds
@@ -56,30 +37,71 @@ impl Kind {
         }
     }
 
-    /// Returns protocol version for device
-    pub fn protocol_version(&self) -> usize {
+    /// Returns protocol version used for writes and initialization.
+    pub fn write_protocol_version(&self) -> usize {
         match self {
-            Self::AMPGD6 => 1, // Back to version 1 - the error might be related to button count or initialization
+            Self::AMPGD6 => 1,
+        }
+    }
+
+    /// Returns the protocol version expected by the D6 input reports.
+    pub fn read_protocol_version(&self) -> usize {
+        match self {
+            Self::AMPGD6 => 3,
         }
     }
 
     /// There is no point relying on manufacturer/device names reported by the USB stack,
     /// so we return custom names for all the kinds of devices
-    pub fn human_name(&self) -> String {
+    pub fn human_name(&self) -> &'static str {
         match &self {
             Self::AMPGD6 => "FIFINE Ampligame D6",
         }
-        .to_string()
+    }
+
+    pub fn image_format(&self, _key: u8) -> ImageFormat {
+        // Larger frames get cropped by the device firmware.
+        // Keep the conservative size and let the renderer center the source image.
+        let size = (100, 100);
+
+        ImageFormat {
+            mode: ImageMode::JPEG,
+            size,
+            rotation: ImageRotation::Rot180,
+            mirror: ImageMirroring::None,
+        }
+    }
+
+    pub fn supports_brightness(&self) -> bool {
+        match self {
+            Self::AMPGD6 => true,
+        }
+    }
+
+    pub fn supports_keepalive(&self) -> bool {
+        match self {
+            Self::AMPGD6 => false,
+        }
+    }
+
+    pub fn known_singleton_limit(&self) -> bool {
+        match self {
+            Self::AMPGD6 => true,
+        }
     }
 
     /// Because "v1" devices all share the same serial number, use custom suffix to be able to connect
     /// two devices with the different revisions at the same time
-    pub fn id_suffix(&self) -> String {
+    pub fn id_suffix(&self) -> &'static str {
         match &self {
             Self::AMPGD6 => "AMPGD6",
         }
-        .to_string()
     }
+}
+
+/// Returns correct image format for device kind and key
+pub fn get_image_format_for_key(kind: &Kind, key: u8) -> ImageFormat {
+    kind.image_format(key)
 }
 
 #[derive(Debug, Clone)]
