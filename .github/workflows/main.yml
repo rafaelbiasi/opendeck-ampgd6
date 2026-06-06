@@ -1,0 +1,50 @@
+name: Build for Raspberry Pi
+
+on:
+  push:
+    branches: [fix-icons]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-rpi:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Build with cargo-zigbuild (aarch64 Linux)
+        uses: addnab/docker-run-action@v3
+        with:
+          image: ghcr.io/rust-cross/cargo-zigbuild:sha-eba2d7e
+          options: -v ${{ github.workspace }}:/io -w /io
+          run: |
+            cargo zigbuild --release \
+              --target aarch64-unknown-linux-gnu \
+              --target-dir target/plugin-rpi
+
+      - name: Collect plugin files
+        run: |
+          ID="st.lynx.plugins.opendeck-ampgd6.sdPlugin"
+          mkdir -p build/$ID
+          cp -r assets build/$ID
+          cp manifest.json build/$ID
+          cp target/plugin-rpi/aarch64-unknown-linux-gnu/release/opendeck-ampgd6 \
+             build/$ID/opendeck-ampgd6-linux
+
+      - name: Create plugin archive
+        run: |
+          cd build
+          zip -r opendeck-ampgd6-rpi.plugin.zip st.lynx.plugins.opendeck-ampgd6.sdPlugin/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opendeck-ampgd6-rpi
+          path: build/opendeck-ampgd6-rpi.plugin.zip
