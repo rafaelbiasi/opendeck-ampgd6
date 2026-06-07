@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "opendeck-ampgd6"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "ahash",
  "data-url",
