@@ -276,7 +276,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
 
     log::info!("Connected to {} for incoming events", candidate.id);
     log::info!(
-        "Reader is ready for {} (write pv={}, read pv={})",
+        "Reader is ready for {} (pv={})",
         candidate.id,
         candidate.kind.protocol_version(),
     );
