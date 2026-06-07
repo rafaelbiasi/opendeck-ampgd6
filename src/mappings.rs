@@ -57,14 +57,13 @@ impl Kind {
         }
     }
 
-    /// Returns protocol version used for writes and initialization.
-    pub fn write_protocol_version(&self) -> usize {
+    /// Returns protocol version for device
+    pub fn protocol_version(&self) -> usize {
         match self {
             Self::AMPGD6 => 1, // Back to version 1 - the error might be related to button count or initialization
             Self::AMPGD6REV2 => 2,
         }
     }
-
     /// There is no point relying on manufacturer/device names reported by the USB stack,
     /// so we return custom names for all the kinds of devices
     pub fn human_name(&self) -> &'static str {
@@ -90,18 +89,21 @@ impl Kind {
     pub fn supports_brightness(&self) -> bool {
         match self {
             Self::AMPGD6 => true,
+            Self::AMPGD6REV2 => true,
         }
     }
 
     pub fn supports_keepalive(&self) -> bool {
         match self {
             Self::AMPGD6 => false,
+            Self::AMPGD6REV2 => false,
         }
     }
 
     pub fn known_singleton_limit(&self) -> bool {
         match self {
             Self::AMPGD6 => true,
+            Self::AMPGD6REV2 => true,
         }
     }
 
@@ -113,11 +115,6 @@ impl Kind {
             Self::AMPGD6REV2 => "AMPGD6REV2",
         }
     }
-}
-
-/// Returns correct image format for device kind and key
-pub fn get_image_format_for_key(kind: &Kind, key: u8) -> ImageFormat {
-    kind.image_format(key)
 }
 
 #[derive(Debug, Clone)]

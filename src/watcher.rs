@@ -17,7 +17,7 @@ use crate::{
 fn get_device_id(dev: &HidDeviceInfo) -> Option<String> {
     let kind = Kind::from_vid_pid(dev.vendor_id, dev.product_id)?;
 
-    match kind.write_protocol_version() {
+    match kind.protocol_version() {
         2 | 3 => Some(format!(
             "{}-{}",
             DEVICE_NAMESPACE,

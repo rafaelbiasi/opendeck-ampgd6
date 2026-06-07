@@ -241,7 +241,7 @@ pub async fn cleanup_device_state(id: &str) {
 pub async fn connect(candidate: &CandidateDevice) -> Result<Device, MirajazzError> {
     let result = Device::connect(
         &candidate.dev,
-        candidate.kind.write_protocol_version(),
+        candidate.kind.protocol_version(),
         KEY_COUNT,
         ENCODER_COUNT,
     )
@@ -278,8 +278,7 @@ async fn device_events_task(candidate: &CandidateDevice) -> Result<(), MirajazzE
     log::info!(
         "Reader is ready for {} (write pv={}, read pv={})",
         candidate.id,
-        candidate.kind.write_protocol_version(),
-        candidate.kind.read_protocol_version()
+        candidate.kind.protocol_version(),
     );
 
     let mut pressed_buttons = 0u16;
